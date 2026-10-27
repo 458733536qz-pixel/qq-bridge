@@ -132,6 +132,30 @@ function orderAddresses(addresses) {
   return ordered;
 }
 
+// 本机代理的 fake-IP 网段（198.18.0.0/15，RFC 2544 保留段）。
+// Clash/Surge 等在 TUN + fake-IP 模式下把**任意**域名解析到这一段，再由代理按 SNI/Host
+// 转发到真实站点。它不是内网服务，但默认仍必须当内网拦截——否则随便一个域名都能解析成它。
+// 这里只对明确属于 QQ 图片/表情 CDN 的主机放行，避免整体削弱 SSRF 防护；
+// 需要覆盖更多域名时用 QQ_BRIDGE_PROXY_FAKE_IP_HOSTS="a.com,b.com" 追加。
+const PROXY_FAKE_IP_V4 = /^198\.1[89]\./;
+// 放行名单：QQ 图片/表情 CDN + B 站（她要读视频页/动态）。其余域名仍按内网拦截。
+const PROXY_FAKE_IP_HOSTS = String(process.env.QQ_BRIDGE_PROXY_FAKE_IP_HOSTS ?? 'qq.com,qq.com.cn,qpic.cn,gtimg.cn,bilibili.com,b23.tv,hdslb.com,bilivideo.com,bilivideo.cn,kiriyuki.com')
+  .split(',')
+  .map((item) => item.trim().toLowerCase())
+  .filter(Boolean);
+
+function isProxyFakeIp(address) {
+  const value = String(address || '').toLowerCase();
+  if (net.isIP(value) === 4) return PROXY_FAKE_IP_V4.test(value);
+  // 同一个代理也会给 fake-IP 配一条 2001:2::/48 的占位 AAAA（同样是 RFC 2544 保留段）。
+  if (net.isIP(value) === 6 && value.startsWith('2001:2:')) return true;
+  return false;
+}
+
+function proxyFakeIpHostAllowed(hostname) {
+  return PROXY_FAKE_IP_HOSTS.some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`));
+}
+
 /** 解析主机名并校验**全部**解析结果，返回可尝试的地址列表（IPv4 优先）。 */
 export async function resolveSafeAddresses(hostname) {
   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
@@ -151,9 +175,10 @@ export async function resolveSafeAddresses(hostname) {
   }
   if (!addresses.length) throw new Error('域名没有解析结果');
   for (const { address } of addresses) {
-    if (isPrivateIp(address)) {
-      throw new Error('域名解析到内网/本机地址，已阻止');
-    }
+    if (!isPrivateIp(address)) continue;
+    // 本机代理把 QQ CDN 解析成 fake-IP 时放行（仅限上面白名单里的主机）。
+    if (isProxyFakeIp(address) && proxyFakeIpHostAllowed(h)) continue;
+    throw new Error('域名解析到内网/本机地址，已阻止');
   }
   const ordered = orderAddresses(addresses);
   return ordered.length ? ordered : [addresses[0].address];

@@ -28,7 +28,7 @@ function ok(cond, name) {
 }
 
 // ── 临时音频库 fixture ─────────────────────────────────────────────────────
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-voice-test-'));
+const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-voice-test-')));
 const voiceDir = path.join(tmp, 'audio');
 fs.mkdirSync(path.join(voiceDir, 'sub'), { recursive: true });
 const emptyAudio = path.join(voiceDir, 'empty.mp3');
