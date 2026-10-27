@@ -3299,6 +3299,7 @@ async function main() {
             scheduleProactiveCheckV2(key);
           }
           log('桥接模式已确定为 reserved2，恢复有限睡眠定时器');
+          startTurnWatchdog();
           // 启动补唤醒：重启/重连后如果还压着没回的消息，几秒内就叫她。
           // 没有这一步，她会带着一堆未读一直静默到下一次主动检查（35~70 分钟），
           // 球球那边看到的就是「有时候她根本不回我」（2026-10-27 晚上真发生过：
@@ -12326,7 +12327,53 @@ async function main() {
    *   ② turn/end 即使没有匹配的 turn/start（重连快照没带上）也要清掉已成空壳的
    *      collector，否则同样会永久繁忙。
    */
+  // ── 回合看门狗 ────────────────────────────────────────────────────────
+  // 2026-10-27 21:39 的真实事故：一个回合在 DSH 里 running=true，3 分钟没有任何新事件，
+  // 桥接只能一直判忙（15 分钟租约，重启还会重新计时），期间他发的每条消息都石沉大海。
+  // 现在：8 分钟完全没有事件 → 主动 cancel，清掉忙标记，有未读就重排一次唤醒。
+  // 阈值 8 分钟是留了余量的：正常回合 1~3 分钟，她最长会等 5 分钟消息。
+  const TURN_WATCHDOG_MS = 8 * 60 * 1000;
+  const turnLastEventAt = new Map(); // sessionId -> 最后一次事件时间
+  const watchdogCancelled = new Set(); // 同一回合只 cancel 一次
+  let turnWatchdogStarted = false;
+  function startTurnWatchdog() {
+    if (turnWatchdogStarted) return;
+    turnWatchdogStarted = true;
+    const timer = setInterval(async () => {
+      const now = Date.now();
+      for (const [sessionId, startedAt] of [...v2TurnStartAt]) {
+        if (!Number.isFinite(startedAt) || now - startedAt < TURN_WATCHDOG_MS) continue;
+        const lastEvent = Math.max(startedAt, turnLastEventAt.get(sessionId) || 0);
+        if (now - lastEvent < TURN_WATCHDOG_MS) continue;
+        if (watchdogCancelled.has(sessionId)) continue;
+        watchdogCancelled.add(sessionId);
+        const key = reverse.get(sessionId) || null;
+        log(`[watchdog] 回合 ${sessionId} 已 ${Math.round((now - lastEvent) / 60000)} 分钟没有任何事件，主动取消`);
+        try {
+          await api.callUnary('session.cancel', { sessionId });
+        } catch (error) {
+          log(`[watchdog] cancel 失败：${error?.message ?? error}`);
+        }
+        v2TurnStartAt.delete(sessionId);
+        collectors.delete(sessionId);
+        turnLeaseNoted.delete(sessionId);
+        if (key) pendingWakeKeys.delete(key);
+        if (key) {
+          try {
+            const st = getSocialV2State(key);
+            if ((st.unread || []).length) {
+              log(`[watchdog] ${key} 还有 ${st.unread.length} 条未读，重排一次唤醒`);
+              scheduleWakeV2(key, 'watchdogRetry');
+            }
+          } catch (error) { log(`[watchdog] 重排唤醒失败：${error?.message ?? error}`); }
+        }
+      }
+    }, 60000);
+    if (timer.unref) timer.unref();
+  }
+
   function trackTurnEvent(sessionId, event) {
+    turnLastEventAt.set(sessionId, Date.now());
     let collector = collectors.get(sessionId);
     if (!collector && event?.type === 'turn/start') {
       collector = createTurnCollector();
