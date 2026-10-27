@@ -21,6 +21,7 @@ import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as roleCard from '../src/role-card.js';
+import * as providerPick from '../src/provider-pick.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import * as ttsApi from '../src/tts-api.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
@@ -157,6 +158,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
     roleCoreContent, roleRecallContent, roleHintForMode, buildRolePayload,
     albumPhotos, resolveAlbumPhoto, sendPhotoV2, extractPhotoMarkers,
+    redactSensitiveHints, resolveChatProvider, pickProvider,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     collectors, setupSleepTimerV2,
@@ -197,7 +199,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...ttsApi, ...roleCard,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...ttsApi, ...roleCard, ...providerPick,
     // Keep local character data out of the isolated network/audit fixture.
     xiaolengTravelContext: () => '', affinityPromptSection: () => '', readAffinity: () => ({}), tickAffinity: () => ({}),
     moodPromptLine: () => '', moodDeltaFromText: () => 0, nudgeMood: () => {},
@@ -214,6 +216,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     processAudioVolume: async (file, { volume = 1, normalize = false, loudness = 'normal' } = {}) => {
       const v = Number(volume);
       const changed = normalize === true || Math.abs(v - 1) > 1e-9;
+      // The transport reads actual inline bytes; a fake conversion must create its fake output too.
+      if (changed && fs.existsSync(file)) fs.copyFileSync(file, `${file}.vol`);
       return {
         path: changed ? `${file}.vol` : file,
         converted: changed,
