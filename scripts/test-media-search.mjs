@@ -395,6 +395,47 @@ await test('webSearch：空结果提示在写缓存之前生成（缓存命中�
   assert.ok(noteAt < cacheAt, 'note 必须在 cache.set 之前生成：缓存存的是 value 的引用，反过来写会让缓存命中丢掉提示');
 });
 
+// QQ system faces are semantic labels; their sysemoji ZIP is not an image.
+await test('系统表情 zip 返回文字标签、不下载，且标签进入真实唤醒内容', async () => {
+  let downloads=0;
+  const h=await bridgeHarness({config:{socialV2:{context:{inlineWakeImages:true},proactive:{enabled:false},sticker:{enabled:false}}},globals:{safeFetchBuffer:async()=>{downloads++;throw Error('system face must not download')}}});
+  try {
+    h.bot.fetchFaceEntity=async id=>{assert.equal(id,9);return {q_des:'/大哭',is_super:false,ani_sticker_type:null,url:'https://wa.qq.com/sysemoji/9.zip?signature=fixture-secret'}};
+    const parts=await h.resolveMediaList([{kind:'face',faceId:'9'}]);
+    assert.equal(parts.length,1);assert.equal(parts[0].type,'text');assert.equal(parts[0].text,'[表情:大哭]');assert.equal(downloads,0);
+    h.setMode('reserved2');h.appendSocialV2Message('group:456','user','[表情9]','[表情9]',false,false,'face-9-message',[{kind:'face',faceId:'9'}],'789',[]);
+    await h.sendWakePromptV2('group:456','question');
+    const prompt=h.calls.prompts.at(-1);assert.ok(prompt.content.some(p=>p.type==='text'&&p.text==='[表情:大哭]'));assert.ok(!prompt.content.some(p=>p.type==='image'));assert.equal(downloads,0);
+  }finally{await h.close()}
+});
+
+await test('zip 兜底忽略超级标志；无动画字段的系统表情同样不下载',async()=>{
+  let downloads=0;const h=await bridgeHarness({globals:{safeFetchBuffer:async()=>{downloads++;throw Error('must not download')}}});
+  try{
+    for(const entity of [{q_des:'/大哭',is_super:true,ani_sticker_type:1,url:'https://wa.qq.com/9.ZIP?x=1'},{q_des:'/大哭',is_super:false,url:'https://wa.qq.com/9.png'},{emoji_name_alias:['/大哭'],url:'https://wa.qq.com/9.png'}]){
+      h.bot.fetchFaceEntity=async()=>entity;const result=await h.fetchMediaData([{kind:'face',faceId:'9'}]);assert.equal(result[0].text,'[表情:大哭]');assert.equal(result[0].data,undefined);
+    }
+    assert.equal(downloads,0);
+  }finally{await h.close()}
+});
+
+await test('超级表情或 ani_sticker 动画继续以内联图片返回',async()=>{
+  const fetched=[];const h=await bridgeHarness({globals:{safeFetchBuffer:async url=>{fetched.push(url);return {buffer:PNG,mimeType:'image/png'}}}});
+  try{
+    for(const flags of [{is_super:true},{is_super:false,ani_sticker_type:1}]){
+      h.bot.fetchFaceEntity=async()=>({q_des:'/大哭',url:'https://public.invalid/super.png',...flags});const parts=await h.resolveMediaList([{kind:'face',faceId:'9'}]);assert.ok(parts.some(p=>p.type==='image'&&p.data===PNG.toString('base64')));assert.ok(parts.some(p=>p.type==='text'&&p.text==='[表情:大哭]'));
+    }
+    assert.equal(fetched.length,2);
+  }finally{await h.close()}
+});
+
+await test('真实图片失败日志含 faceId 和 host，不包含 URL 签名',async()=>{
+  const logs=[];const h=await bridgeHarness({globals:{console:{log:(...args)=>logs.push(args.join(' ')),error(){}},safeFetchBuffer:async()=>{throw Error('failed https://public.invalid/super.png?signature=do-not-log')}}});
+  try{
+    h.bot.fetchFaceEntity=async()=>({q_des:'/大哭',is_super:true,url:'https://public.invalid/super.png?signature=do-not-log'});await h.resolveMediaList([{kind:'face',faceId:'9'}]);const line=logs.find(l=>l.includes('表情图片抓取失败'));assert.ok(line?.includes('faceId=9'));assert.ok(line.includes('host=public.invalid'));assert.ok(!line.includes('do-not-log'));assert.ok(!line.includes('signature='));
+  }finally{await h.close()}
+});
+
 if (failures) {
   console.error(`\n${failures} 项失败`);
   process.exitCode = 1;

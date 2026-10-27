@@ -8458,26 +8458,39 @@ async function main() {
 
   async function fetchFaceMedia(media) {
     const faceId = Number(media.faceId);
-    // 系统小表情（face 段）：只有数字 id 才有对应实体；拿不到时至少保留 summary 文案。
-    const fallbackText = media.summary ? `[表情:${media.summary}]` : `[表情#${media.faceId}]`;
+    const faceName = value => String(value || '').trim().replace(/^\/+/, '');
+    const fallbackName = faceName(media.summary);
+    const fallbackText = fallbackName ? `[表情:${fallbackName}]` : `[表情#${media.faceId}]`;
     if (!Number.isInteger(faceId)) return { text: fallbackText };
     try {
       const face = await bot.fetchFaceEntity(faceId);
       if (face && typeof face === 'object') {
-        const desc = face.q_des || (Array.isArray(face.emoji_name_alias) && face.emoji_name_alias[0]) || '';
+        const desc = faceName(face.q_des || (Array.isArray(face.emoji_name_alias) && face.emoji_name_alias[0]));
+        const text = desc ? `[表情:${desc}]` : fallbackText;
+        let host = 'unknown', pathname = String(face.url || '').split(/[?#]/)[0];
+        try { const url = new URL(String(face.url)); host = url.hostname; pathname = url.pathname; } catch {}
+        const animated = Object.entries(face).some(([key, value]) => key.startsWith('ani_sticker_') && value != null && value !== '' && value !== false);
+        // QQ system faces point to sysemoji ZIP bundles, not image files.
+        // Keep their meaning as text; only animated/super faces fetch image bytes.
+        if (/\.zip$/i.test(pathname) || (face.is_super !== true && !animated)) {
+          return { text, mimeType: null, buffer: null };
+        }
         if (face.url) {
           try {
             const fetched = await safeFetchBuffer(String(face.url), MAX_MEDIA_BYTES);
             const accepted = acceptImageBuffer(fetched.buffer, '表情图片');
-            if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(face.url), text: desc ? `[表情:${desc}]` : '' };
+            if (accepted) return { ...accepted, mimeType: accepted.mimeType || mimeFromUrl(face.url), text: desc ? text : '' };
           } catch (error) {
-            log(`表情图片抓取失败: ${error?.message ?? error}`);
+            const detail = String(error?.message ?? error).replace(/https?:\/\/[^\s)]+/g, value => {
+              try { return new URL(value).origin; } catch { return '[URL]'; }
+            });
+            log(`表情图片抓取失败 faceId=${faceId} host=${host}: ${detail}`);
           }
         }
-        return { text: desc ? `[表情:${desc}]` : fallbackText };
+        return { text };
       }
     } catch (error) {
-      log(`fetchFaceEntity 失败: ${error?.message ?? error}`);
+      log(`fetchFaceEntity 失败 faceId=${faceId}: ${error?.message ?? error}`);
     }
     return { text: fallbackText };
   }

@@ -27,7 +27,7 @@ import * as ttsApi from '../src/tts-api.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {} } = {}) {
+export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {}, faceEntities = {} } = {}) {
   const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-audit-bridge-')));
   fs.mkdirSync(path.join(temp, 'src'));
   fs.mkdirSync(path.join(temp, 'state'));
@@ -109,7 +109,8 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
       // Valid 1 × 1 PNG, supplied entirely in memory by the fixture gateway.
       return { base64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+k3ioAAAAASUVORK5CYII=' };
     }
-    async fetchFaceEntity(id) { calls.faces.push(id); return null; }
+    // faceEntities: 测试塞真实 OneBot fetch_face_entity 的 payload（系统表情/市场表情形状差异）
+    async fetchFaceEntity(id) { calls.faces.push(id); return faceEntities[id] ?? faceEntities[String(id)] ?? null; }
     async request(action, params = {}) {
       // 群成员列表：v2 读工具 qq_get_group_members 会用到（含 WS 不可用时的 HTTP 兜底路径）。
       if (action === 'get_group_member_list') {
@@ -166,6 +167,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     initialPrompts, initialPromptMaxChars,
     extractMediaFromSegments, segmentsToText, fetchOneBotImage, fetchMediaData, resolveMediaList,
     emojiCdnCandidates, getImageDimensions, acceptImageBuffer, MAX_MEDIA_BYTES, bot,
+    fetchFaceMedia, fetchOneBotImage,
     isConversationBusyV2, v2TurnStartAt, turnLeaseNoted, TURN_BUSY_LEASE_MS,
     settingFromDshNamespace, selfIdentityTextV2, buildWakeReminderPromptV2,
     getMode() { return currentMode; },
