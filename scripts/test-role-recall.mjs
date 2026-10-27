@@ -68,13 +68,13 @@ await check('闲聊不带无关细节（没命中就一个字都不加）', asyn
 
 await check('点名要某一节：只回那一节，不夹带整卡', () => {
   const payload = bridge.buildRolePayload('生气');
-  assert.equal(payload.section.title, '生气详解与收场');
-  assert.match(payload.section.body, /台词参考|收场规则/);
+  assert.equal(payload.section.title, '生气与情绪变化');
+  assert.match(payload.section.body, /轻微不爽|认真生气/);
   assert.equal(payload.hint, undefined, '按节返回时不该再带核心全文');
   const missing = bridge.buildRolePayload('不存在的一节');
   assert.equal(missing.section, null);
   assert.match(missing.sectionError, /没有/);
-  assert.match(missing.sectionError, /外形与样子/, '报错要列出可用的节');
+  assert.match(missing.sectionError, /外形/, '报错要列出可用的节');
 });
 
 await check('事件话术：教她按编号收尾，并说明怎么自然地提', async () => {

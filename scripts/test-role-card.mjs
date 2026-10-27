@@ -183,7 +183,7 @@ test('真实人格卡：core 与 recall 可解析，核心明显短于整卡', (
     assert.ok(section.body.length <= 1600, `${section.title} 太长（${section.body.length}）`);
   }
   // 核心卡里的关键硬约束必须还在
-  for (const must of ['球球', '不像客服', '不写小作文', '不查岗']) {
+  for (const must of ['球球', '不要客服腔', '不编造', '不查岗']) {
     assert.match(core, new RegExp(must.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `核心卡缺「${must}」`);
   }
   // 召回要能被常见话术命中
@@ -191,25 +191,26 @@ test('真实人格卡：core 与 recall 可解析，核心明显短于整卡', (
   assert.ok(pickRecallSections(recall, '你是不是生气了').picked.length > 0);
 });
 
-test('拆分不丢内容：整卡每个小节都能在 core 或 recall 里找到落点', () => {
+test('关键约束不丢：V3.0 的硬规则都能在 core 或 recall 里找到', () => {
   const core = fs.readFileSync(new URL('../roles/鱼小冷.core.md', import.meta.url), 'utf8');
   const recall = fs.readFileSync(new URL('../roles/鱼小冷.recall.md', import.meta.url), 'utf8');
-  const full = fs.readFileSync(new URL('../roles/鱼小冷.md', import.meta.url), 'utf8');
-  const norm = (s) => String(s).replace(/\s+/g, '');
-  const bag = norm(core) + norm(recall);
-  const sections = parseRoleSections(full).filter((s) => s.heading);
-  const missing = [];
-  for (const section of sections) {
-    // 卡名标题（「角色卡：鱼小冷」）下面只有维护说明，不是人设内容，跳过
-    if (/^角色卡/.test(section.heading)) continue;
-    // 每节的正文行里至少有 1 行（足够长的）落在 core/recall 里，就算这节没被丢
-    const lines = section.lines
-      .map((line) => line.replace(/^#+\s*/, '').replace(/^[-*]\s*/, '').replace(/^>\s*/, '').trim())
-      .filter((line) => line.length >= 10);
-    // 纯标题小节（如整卡的「# 角色卡：鱼小冷」）没有正文，跳过
-    if (lines.length === 0) continue;
-    const hit = lines.some((line) => bag.includes(norm(line)));
-    if (!hit) missing.push(section.heading);
-  }
-  assert.deepEqual(missing, [], `这些小节在 core/recall 里没有落点：${missing.join('、')}`);
+  const bag = `${core}\n${recall}`;
+  const rules = [
+    ['被问 AI 要诚实', /必须诚实回答|诚实回答/],
+    ['不许冒充现实真人', /不冒充现实中的真人|不装作现实里的真人/],
+    ['不编造经历/结果', /不编造|不能编造/],
+    ['不假装发过东西', /不假装|不能假装/],
+    ['不要客服腔', /客服腔|我理解你的感受/],
+    ['不用动漫傲娇腔', /动漫傲娇|本小姐/],
+    ['不用括号写动作', /不用括号|不使用括号/],
+    ['不限字数（别强制短）', /不限字数|不限制字数/],
+    ['不每轮固定两条', /固定发两条|固定发送两条/],
+    ['不每条都追问', /不每条结尾追问|不要每次最后提问/],
+    ['允许没意义的对话', /允许没意义的对话|没有实际意义/],
+    ['冷静期/生气不翻旧账', /不翻旧账/],
+    ['好感度不编数值', /不主动播报|不能凭空编造/],
+    ['办事正事优先', /正事优先/],
+  ];
+  const missing = rules.filter(([, re]) => !re.test(bag)).map(([label]) => label);
+  assert.deepEqual(missing, [], `这些硬规则在 core/recall 里找不到：${missing.join('、')}`);
 });
