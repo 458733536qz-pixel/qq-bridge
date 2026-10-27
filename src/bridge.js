@@ -87,6 +87,30 @@ const AFFINITY_FILE = path.join(STATE_DIR, 'affinity.json');
 // 放在 ~/.bili-ai/ 是为了和她的凭据/人设在一起，换机器拷一个目录就带走。
 const SHARED_MEMORY_FILE = path.join(os.homedir(), '.bili-ai', 'memory.md');
 // 跨平台“流水”：两边各自把「我刚跟他说了什么」追加进来，对方醒来能看到。
+// 他给的「人物说明书」：常驻只注入摘要，细节按他这句话的关键词召回一节。
+// 这份是认识他的**入口、不是定论**——相处里发现不一样，以相处为准（所以文件随时可改，热生效）。
+const ABOUT_BOY_FILE = path.join(os.homedir(), '.bili-ai', '关于球球.md');
+let aboutBoyCache = { key: '', head: '', sectionsText: '' };
+function readAboutBoy() {
+  try {
+    const stat = fs.statSync(ABOUT_BOY_FILE);
+    const key = `${stat.mtimeMs}:${stat.size}`;
+    if (aboutBoyCache.key === key) return aboutBoyCache;
+    const raw = fs.readFileSync(ABOUT_BOY_FILE, 'utf8');
+    const idx = raw.indexOf('\n## ');
+    const head = (idx > 0 ? raw.slice(0, idx) : raw)
+      .split('\n')
+      .filter((line) => line.trim() && !line.startsWith('#') && !line.startsWith('>'))
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    aboutBoyCache = { key, head, sectionsText: idx > 0 ? raw.slice(idx) : '' };
+    return aboutBoyCache;
+  } catch {
+    return { key: '', head: '', sectionsText: '' };
+  }
+}
+
 const CROSS_LOG_FILE = path.join(os.homedir(), '.bili-ai', 'cross-log.md');
 // 日记（和 B 站那边同一本）：她在消息里写 [日记] / [私日记]，桥接把内容摘出来写进文件，
 // 发到 QQ 的正文里不留标记。这样 QQ 这边发生的事也能进她自己的生活记录。
@@ -2912,6 +2936,33 @@ async function main() {
     // 活着的回合会在 turn/end 清掉；真丢了的回合最多再忙一个租约期就自动解除。
     if (!v2TurnStartAt.has(sessionId)) v2TurnStartAt.set(sessionId, Date.now());
     log(`重连后恢复了进行中的回合（${sessionId}，turn ${[...open].join(',')}）`);
+    // 重启前那个回合的进行中工具调用**已经随旧进程死了**（它们打的是旧 http server），
+    // 这个回合永远等不到结果 —— 典型表现就是「她活着但一句话不回」，要等 8 分钟看门狗。
+    // 所以启动时恢复出来的回合，等 4 秒确认没有新事件，就直接 cancel，让未读重新被唤醒处理。
+    const restoredAt = Date.now();
+    const orphanTimer = setTimeout(async () => {
+      try {
+        const last = turnLastEventAt.get(sessionId) || 0;
+        if (Date.now() - last < 4000) return; // 有活动就不是孤儿，交给正常流程/看门狗
+        log(`[watchdog] 启动时恢复的回合 ${sessionId} 没有新事件，判定为孤儿回合，主动取消`);
+        await api.callUnary('session/cancel', { sessionId });
+      } catch (error) {
+        log(`[watchdog] 取消孤儿回合失败：${error?.message ?? error}`);
+      } finally {
+        v2TurnStartAt.delete(sessionId);
+        collectors.delete(sessionId);
+        const key = reverse.get(sessionId);
+        if (key) {
+          pendingWakeKeys.delete(key);
+          try {
+            const st = getSocialV2State(key);
+            if ((st.unread || []).length) scheduleWakeV2(key, 'restoredTurnRetry');
+          } catch { /* 忽略 */ }
+        }
+      }
+    }, 4000);
+    if (orphanTimer.unref) orphanTimer.unref();
+    void restoredAt;
   }
 
   // 唤醒“防卡死”租约：正常应在 turn/end 时删除 pendingWakeKeys；若 DSH 接受了但一直没回合结束，
@@ -3740,7 +3791,7 @@ async function main() {
       if (consoleToken && !tokenMatches && !publicAffinityRead) {
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
-          res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const t=prompt(\'请输入控制台访问令牌\');if(t)location.href=\'/?token=\'+encodeURIComponent(t);</script>');
+          res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const u=new URL(location.href);const t=!u.searchParams.has("token")&&localStorage.getItem("consoleToken")||prompt("请输入控制台访问令牌");if(t){u.searchParams.set("token",t);location.replace(u.pathname+u.search+u.hash);}</script>');
         } else {
           sendJson({ ok: false, error: '未授权：请提供控制台访问令牌' }, 401);
         }
@@ -3782,12 +3833,14 @@ async function main() {
           }
         }
       }
-      // CSRF 防护：所有写操作必须是 application/json，且（若带 Origin）必须来自本机页面。
+      // CSRF 防护：写操作使用 JSON（模型文件导入专用端点使用 octet-stream），且 Origin 必须来自本机页面。
       // 默认未配 consoleToken 时，这可阻止任意网页用表单/跨站请求触发
       // /api/restart、/api/workspace/reset、/api/role 等破坏性接口。
       if (req.method !== 'GET') {
         const ctype = String(req.headers['content-type'] ?? '');
-        if (!ctype.toLowerCase().includes('application/json')) {
+        const isModelUpload = req.method === 'POST' && url.pathname === '/api/tts/gsv-upload'
+          && ctype.split(';')[0].trim().toLowerCase() === 'application/octet-stream';
+        if (!ctype.toLowerCase().includes('application/json') && !isModelUpload) {
           sendJson({ ok: false, error: '请求必须是 application/json' }, 415);
           return;
         }
@@ -11385,6 +11438,18 @@ async function main() {
     // 【照片】相册是她的真照片（~/.bili-ai/album-real/self）。工具面上没有「发照片」的路时，
     // 她只能嘴上说「我发你一张」——这里给她一条真能用的路：写 [照片] 序号，桥接替她发。
     // 清单只在他要照片/聊长相时给（一张一行的清单每轮都带太贵）。
+    let aboutLine = '';
+    try {
+      const about = readAboutBoy();
+      if (about.head) {
+        const picked = about.sectionsText
+          ? pickRecallSections(about.sectionsText, cueText, { limit: 1, maxChars: 600 })
+          : { text: '' };
+        aboutLine = `【关于球球】（他给的说明书，是认识他的入口、不是定论；相处里发现不一样就以相处为准）\n${about.head}`
+          + (picked.text ? `\n（他刚说到相关的）\n${picked.text}` : '')
+          + '\n\n';
+      }
+    } catch { /* 说明书读不到就不注入 */ }
     let photoLine = '';
     try {
       const album = albumPhotos('self');
@@ -11427,7 +11492,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st) + (tts.read().enabled && tts.read().aiEnabled ? '\n【可合成语音】可用 qq_tts_send 把想说的话合成为语音条；delivery按本句情绪选择natural/warm/playful/comfort/quiet，保持固定音色，不每句叹气或轻笑；偶尔使用，verified=true才算QQ已回读。\n' : '');
-    const base = handoffLine + roleLine + affinityLine + moodLine + recallLine + personaRecallLine + photoLine + continuityLine + identityLine + eventLine + diaryLine + burstLine + tokenLine + initialPromptLine + antiAiLine + replyDutyLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + crossLogLine + sharedMemoryLine + participationLine + preSleepLine + timeSenseLine + chatLifeLine;
+    const base = handoffLine + roleLine + affinityLine + moodLine + recallLine + personaRecallLine + aboutLine + photoLine + continuityLine + identityLine + eventLine + diaryLine + burstLine + tokenLine + initialPromptLine + antiAiLine + replyDutyLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + crossLogLine + sharedMemoryLine + participationLine + preSleepLine + timeSenseLine + chatLifeLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
