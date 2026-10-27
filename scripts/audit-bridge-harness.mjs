@@ -21,6 +21,7 @@ import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
 import * as roleCard from '../src/role-card.js';
+import * as promptContext from '../src/prompt-context.js';
 import * as providerPick from '../src/provider-pick.js';
 import * as stateAcl from '../src/state-acl.mjs';
 import * as ttsApi from '../src/tts-api.js';
@@ -156,7 +157,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     ensureSession, ensureSlangLearnerSession, resolvePresetName, deliverPrompt, drainPromptQueue,
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
-    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2, appendCrossLog,
     roleCoreContent, roleRecallContent, roleHintForMode, buildRolePayload,
     albumPhotos, resolveAlbumPhoto, sendPhotoV2, extractPhotoMarkers,
     redactSensitiveHints, resolveChatProvider, pickProvider,
@@ -187,7 +188,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
   bot.onPrivateMessage(async (event) => {`);
   const timers = new Set();
   const context = vm.createContext({
-    fs, os, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
+    fs, os: { ...os, homedir: () => temp }, path, http, crypto, fileURLToPath, URL, Buffer, AbortSignal, console: { log() {}, error() {} },
     fetch: fakeFetch,
     // 锁文件探测用（bridge.js 顶层的 consolePortInUse）；
     // 固定桩掉：测试不应该真去 netstat 宿主机。
@@ -201,7 +202,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...ttsApi, ...roleCard, ...providerPick,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...ttsApi, ...roleCard, ...providerPick, ...promptContext,
     // Keep local character data out of the isolated network/audit fixture.
     xiaolengTravelContext: () => '', affinityPromptSection: () => '', readAffinity: () => ({}), tickAffinity: () => ({}),
     moodPromptLine: () => '', moodDeltaFromText: () => 0, nudgeMood: () => {},

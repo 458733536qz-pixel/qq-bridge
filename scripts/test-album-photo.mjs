@@ -5,15 +5,13 @@
 // 这里守住三件事：只读相册白名单目录、名字不能穿越、发出去的段确实是那张图。
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import http from 'node:http';
 import assert from 'node:assert/strict';
 import { bridgeHarness } from './audit-bridge-harness.mjs';
 
-const ALBUM = path.join(os.homedir(), '.bili-ai', 'album-real', 'self');
-const photos = fs.existsSync(ALBUM)
-  ? fs.readdirSync(ALBUM).filter((f) => /\.(jpe?g|png|webp|gif)$/i.test(f)).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
-  : [];
+// 夹具现在把 os.homedir() 指到临时目录（GPT 的隔离改动），所以**不能**再读真相册：
+// 在临时 HOME 里造三张图 + 一份 index.md，测的仍是同一条代码路径，但完全不碰她的相册。
+const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000a4944415478da63000100000500010d0a2db40000000049454e44ae426082', 'hex');
 
 let failed = 0;
 const check = async (label, fn) => {
@@ -42,13 +40,21 @@ const request = (server, { method, path: urlPath, token, body, timeoutMs = 8000 
 });
 
 console.log('相册发照片：\n');
-if (!photos.length) {
-  console.log('  ⏭  跳过：本机相册为空（~/.bili-ai/album-real/self）');
-  process.exit(0);
-}
 
 const h = await bridgeHarness({ files: { 'state/mode.json': { mode: 'reserved2' } } });
 h.refreshMode?.();
+const ALBUM = path.join(h.temp, '.bili-ai', 'album-real', 'self');
+fs.mkdirSync(ALBUM, { recursive: true });
+for (const name of ['01-测试-看镜头.jpg', '02-测试-侧头.jpg', '03-测试-笑.jpg']) {
+  fs.writeFileSync(path.join(ALBUM, name), PNG);
+}
+fs.writeFileSync(path.join(h.temp, '.bili-ai', 'album-real', 'index.md'), [
+  '# 我的相册',
+  '',
+  '- `01-测试-看镜头.jpg` — 测试用图，看镜头',
+  '- `02-测试-侧头.jpg` — 测试用图，侧头',
+  '',
+].join('\n'));
 
 await check('相册列表：文件名 + 一句话说明都读得到', () => {
   const list = h.albumPhotos('self');

@@ -40,6 +40,7 @@
     "test:preset-prompt": "node scripts/test-preset-prompt.mjs",
     "test:role-card": "node scripts/test-role-card.mjs",
     "test:role-recall": "node scripts/test-role-recall.mjs",
+    "test:prompt-context": "node --test scripts/test-prompt-context.mjs",
     "test:album-photo": "node scripts/test-album-photo.mjs",
     "test:provider-pick": "node --test scripts/test-provider-pick.mjs",
     "test:error-redact": "node scripts/test-error-redact.mjs",

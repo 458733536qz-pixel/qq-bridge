@@ -22,6 +22,7 @@ import { affinityPromptSection, levelOf, readAffinity, tickAffinity } from './af
 import { moodDeltaFromText, moodPromptLine, nudgeMood } from './mood.js';
 import { pickProvider } from './provider-pick.js';
 import { archiveMessage, recallByCue } from './memory-cool.js';
+import { compactSharedMemory, compactCrossLog } from './prompt-context.js';
 import { pathToFileURL as __pathToFileURL } from 'node:url';
 // 连续性生活状态（GPT 写的模块）：事件账本 + 精力/忙闲 + 记忆来源，纯规则零模型
 let continuity = null;
@@ -11124,14 +11125,10 @@ async function main() {
   // ── 跨平台共同记忆（QQ ↔ B 站同一个灵魂）────────────────────────
   // 文件：~/.bili-ai/memory.md（B 站插件读的是同一个文件）。
   // 这里只做两件事：唤醒时注入前半部分、AI 记记忆时追加一行。
-  function readSharedMemory(limit = 5000) {
+  function readSharedMemory(limit = 1080, cue = '') {
     try {
-      const text = fs.readFileSync(SHARED_MEMORY_FILE, 'utf8').trim();
-      if (!text) return '';
-      return text.length > limit ? `…（更早的内容略）\n${text.slice(-limit)}` : text;
-    } catch {
-      return '';
-    }
+      return compactSharedMemory(fs.readFileSync(SHARED_MEMORY_FILE, 'utf8'), { cue, maxChars: limit });
+    } catch { return ''; }
   }
 
   function appendSharedMemory(source, content) {
@@ -11170,7 +11167,7 @@ async function main() {
   function readCrossLog(limit = 30) {
     try {
       const lines = fs.readFileSync(CROSS_LOG_FILE, 'utf8').split('\n').filter(Boolean);
-      return lines.slice(-limit).join('\n');
+      return compactCrossLog(lines.join('\n'), { limit, maxChars: 250 });
     } catch {
       return '';
     }
@@ -11186,9 +11183,11 @@ async function main() {
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
     const crossLogText = readCrossLog(12);
     const crossLogLine = crossLogText
-      ? `【你在另一个平台上的动静】（QQ 和 B 站是同一个你，这是两边的流水，最新的在最后）\n${crossLogText}\n\n`
+      ? `【你在另一个平台上的动静】（按先后；未署名为你的发言）\n${crossLogText}\n\n`
       : '';
-    const sharedMemoryText = readSharedMemory() + xiaolengTravelContext();
+    const memoryCue = [...(st.recentMessages || [])].reverse().find(m => m && !m.isSelf);
+    const travelContext = xiaolengTravelContext();
+    const sharedMemoryText = readSharedMemory(Math.max(0, 1080 - travelContext.length), String(memoryCue?.text || memoryCue?.plain || '')) + travelContext;
     const sharedMemoryLine = sharedMemoryText
       ? `【你和球球的共同记忆】（QQ 和 B 站共用同一份，B 站那边发生的事也会写进来）\n${sharedMemoryText}\n想记住新东西就用 qq_memory_append，会自动同步进这份记忆。\n\n`
       : '';
