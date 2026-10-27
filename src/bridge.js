@@ -11336,7 +11336,7 @@ async function main() {
   function readCrossLog(limit = 30) {
     try {
       const lines = fs.readFileSync(CROSS_LOG_FILE, 'utf8').split('\n').filter(Boolean);
-      return compactCrossLog(lines.join('\n'), { limit, maxChars: 250 });
+      return lines.slice(-limit).join('\n');
     } catch {
       return '';
     }
@@ -11350,9 +11350,24 @@ async function main() {
     const tokenLine = `【会话令牌】${st.agentToken}（调用二代状态工具时请在参数中带上此令牌）\n\n`;
     const memoryText = formatMemoryV2(st);
     const memoryLine = memoryText ? `${memoryText}\n\n` : '';
-    const crossLogText = readCrossLog(12);
+    const crossLogRaw = readCrossLog(60);
+    // 最近的流水：条数少一点、每行给宽一点（认得出自己说过什么），另外**单独钉一条 B 站**——
+    // B 站可能几十分钟没动静，很容易被 QQ 的流水挤出窗口；她要是想不起来自己在 B 站说过什么，
+    // 就会两边说同一件事、像两个人（球球 2026-10-28 的诉求）。
+    let crossLogText = '';
+    if (crossLogRaw) {
+      crossLogText = compactCrossLog(crossLogRaw, { limit: 18, maxChars: 520, width: 60 });
+      const rawLines = crossLogRaw.split('\n').filter(Boolean);
+      const lastBili = [...rawLines].reverse().find((line) => line.includes('[B站'));
+      if (lastBili) {
+        const probe = lastBili.trim().slice(0, 18);
+        if (probe && !crossLogText.includes(probe)) {
+          crossLogText += `\n（你在 B 站最后说的）${lastBili.replace(/^-\s*/, '').trim().slice(0, 90)}`;
+        }
+      }
+    }
     const crossLogLine = crossLogText
-      ? `【你在另一个平台上的动静】（按先后；未署名为你的发言）\n${crossLogText}\n\n`
+      ? `【你在另一个平台上的动静】（QQ 和 B 站是同一个你，按先后；未署名为你的发言）\n${crossLogText}\n**这边刚在另一个平台说过的事，别在那边再说一遍；同一件事只挑一边讲；两边的对话要接得上。**\n\n`
       : '';
     const memoryCue = [...(st.recentMessages || [])].reverse().find(m => m && !m.isSelf);
     const travelContext = xiaolengTravelContext();

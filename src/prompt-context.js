@@ -56,7 +56,7 @@ export function compactSharedMemory(text,{cue='',maxChars=1100,recentLimit=12}={
  if(lines.length)output+='\n'+label+'\n'+lines.join('\n');
  return clip(output,max);
 }
-export function compactCrossLog(text,{limit=12,maxChars=250}={}){
+export function compactCrossLog(text,{limit=12,maxChars=250,width:baseWidth=32}={}){
  const max=Math.max(0,Math.floor(maxChars));if(!max)return '';
  const rows=String(text||'').split(/\r?\n/).filter(l=>l.trim()).slice(-limit).map(line=>{
   const m=line.match(/^\s*-?\s*(\d{2}-\d{2})\s+(\d{2}:\d{2})\s+\[([^\]]+)\]\s*(.*)$/);
@@ -74,7 +74,7 @@ export function compactCrossLog(text,{limit=12,maxChars=250}={}){
   }
   return lines.join('\n');
  };
- let width=32,result=render(rows,width);
+ let width=Math.max(12,Math.floor(Number(baseWidth)||32)),result=render(rows,width);
  while(result.length>max&&width>12){width-=4;result=render(rows,width);}
  let omitted=0;
  while(result.length>max&&rows.length>1){rows.shift();omitted++;result='…略前'+omitted+'条\n'+render(rows,width);}
