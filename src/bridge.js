@@ -2770,6 +2770,8 @@ async function main() {
   const collectors = new Map(); // sessionId -> turn collector
   const sendToolSucceededSessions = new Set(); // sessionId：当前 turn 内 MCP 发送类工具至少成功一次
   const v2TurnStartAt = new Map(); // sessionId -> timestamp：reserved2 turn 开始时间，用于判断是否“无行动”
+  // 回合出错后的自动重试计数（key -> 次数）；成功发出一条消息时清零。
+  const agentErrorRetries = new Map();
   const toolCallNames = new Map(); // sessionId -> Map<callId, toolName>：用于结果日志关联工具名
   const pendingSendToolCalls = new Map(); // sessionId -> Set<callId>：等待 tool/result 的发送类调用
   // reserved2 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
@@ -3297,6 +3299,27 @@ async function main() {
             scheduleProactiveCheckV2(key);
           }
           log('桥接模式已确定为 reserved2，恢复有限睡眠定时器');
+          // 启动补唤醒：重启/重连后如果还压着没回的消息，几秒内就叫她。
+          // 没有这一步，她会带着一堆未读一直静默到下一次主动检查（35~70 分钟），
+          // 球球那边看到的就是「有时候她根本不回我」（2026-10-27 晚上真发生过：
+          // 21:47 重启后压着 30 条未读，日志一片安静）。
+          for (const key of socialV2.conversations.keys()) {
+            try {
+              const st = getSocialV2State(key);
+              const unread = Array.isArray(st.unread) ? st.unread : [];
+              const lastRead = Number(st.lastReadThroughSeq) || 0;
+              const maxSeq = unread.reduce((max, item) => Math.max(max, Number(item?.seq) || 0), 0);
+              if (!unread.length || maxSeq <= lastRead) continue;
+              const delay = 4000 + Math.round(Math.random() * 3000);
+              const timer = setTimeout(() => {
+                try { sendWakePromptV2(key, 'backlog'); } catch (error) { log(`[reserved2] 补唤醒失败 ${key}: ${error?.message ?? error}`); }
+              }, delay);
+              if (timer.unref) timer.unref();
+              log(`[reserved2] 启动补唤醒 ${key}：${unread.length} 条未读，${Math.round(delay / 1000)} 秒后叫她`);
+            } catch (error) {
+              log(`[reserved2] 启动补唤醒检查失败 ${key}: ${error?.message ?? error}`);
+            }
+          }
         }
         try { await flushQueue(); } catch (error) { log('补投队列异常:', error?.message ?? error); }
         // DSH 恢复后，把离线期间攒下的黑话学习窗口补触发
@@ -10749,6 +10772,18 @@ async function main() {
   function recordSentMessagesV2(key, messages) {
     const st = getSocialV2State(key);
     const now = Date.now();
+    // 成功发出消息 ⇒ 说明这一轮恢复正常了，清掉出错重试计数。
+    if (Array.isArray(messages) && messages.length) agentErrorRetries.delete(key);
+    // 「回过了」= 看过了：把**已经给她看过的**未读消息确认掉，别让「未读 30 条」一直挂着。
+    // 以前她回完话不调 mark_read，未读数就一直是 30，下一轮又看到同一批消息，
+    // 要么对着旧消息再回一遍（球球看到的就是"怎么又说了一遍"），要么以为自己没回。
+    if (Array.isArray(messages) && messages.length && Array.isArray(st.unread) && st.unread.length) {
+      const through = readThroughSeqV2(st);
+      if (through > 0) {
+        const cleared = acknowledgeMessagesV2(st, through);
+        if (cleared > 0) log(`[reserved2] ${key} 发完消息后自动确认已读 ${cleared} 条（throughSeq=${through}）`);
+      }
+    }
     const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
     const list = Array.isArray(messages) ? messages : [];
     for (let i = 0; i < list.length; i++) {
@@ -11202,7 +11237,11 @@ async function main() {
     // 避免唤醒 prompt 出现两份黑话表。
     const participationText = formatParticipationV2(st);
     const participationLine = participationText ? `${participationText}\n\n` : '';
-    const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、已读乱回、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
+    const antiAiLine = '【反AI味】你不是客服：不用有求必应，可以装傻、敷衍、拒绝推荐；少用“一绝/真管用/保证/绝对”这类词。\n\n';
+    // 「必回」和「别装卡」是球球明确要求的（2026-10-27：他很反感她有时候干脆不回、
+    // 或者拿“卡了/没看到”当解释）。放在固定段里，每轮都在。
+    const replyDutyLine = '【必回】他发给你的消息至少要回一句——不接梗、只回“嗯”都行；只有他明确说“不聊了/我睡了/你忙”才可以不回。别装没看见，别用“已读不回”当态度。\n'
+      + '【别装卡】回晚了、漏回了、重复发了，就直说“刚在忙”“刚看到”；**不许**拿“卡了、没收到、没看到、网络不好、掉线、设备问题”当解释——那是骗人，比沉默更让人不舒服。\n\n';
     const eventLine = '【事件】答应了他什么、或者有话没说完，就写 [事件] 一句话；做完了写 [事件完] 编号（【待跟进】里的 #3 就写 [事件完] 3）。\n【待跟进】里的到期以后，别单独开一句“提醒你一下”，也别把几件一次倒出来：\n- 顺着当下的话题提：他刚说到学校/工作/在忙什么，就接一句“对了，你那个报名弄了没”；\n- 或者拿自己的事垫一下：“我刚翻备忘录才想起来，问下你…”；\n- 他正说着别的、情绪不对，就先不插——等这个话题收尾再提。\n同一件事一天最多主动提一次；他没接就收住，下次换个时机，别追着问、别复述“我提醒过你”。提了或做完了就 [事件完] 编号关掉；一直没回应的也别每天嚼一遍。\n\n';
     const diaryLine = '【日记】想给自己记一笔，就在话后面单独写 [日记] 或 [私日记] 加内容（例：[私日记] 他今天又把话说一半）。桥接会写进日记并从发出去的消息里删掉；别记流水账，一天最多两条。\n\n';
     const burstLine = '【分条】一次可以发 1–3 条：先把反应发出去，再补一句自己的话；每条一个意群，别把三句塞进一条，也别把一句完整的话拆成两条。想找他的时候就直接开口，不用等他说完。\n\n';
@@ -11311,7 +11350,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st) + (tts.read().enabled && tts.read().aiEnabled ? '\n【可合成语音】可用 qq_tts_send 把想说的话合成为语音条；delivery按本句情绪选择natural/warm/playful/comfort/quiet，保持固定音色，不每句叹气或轻笑；偶尔使用，verified=true才算QQ已回读。\n' : '');
-    const base = handoffLine + roleLine + affinityLine + moodLine + recallLine + personaRecallLine + photoLine + continuityLine + identityLine + eventLine + diaryLine + burstLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + crossLogLine + sharedMemoryLine + participationLine + preSleepLine + timeSenseLine + chatLifeLine;
+    const base = handoffLine + roleLine + affinityLine + moodLine + recallLine + personaRecallLine + photoLine + continuityLine + identityLine + eventLine + diaryLine + burstLine + tokenLine + initialPromptLine + antiAiLine + replyDutyLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + crossLogLine + sharedMemoryLine + participationLine + preSleepLine + timeSenseLine + chatLifeLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;
@@ -12644,7 +12683,21 @@ async function main() {
                 // 以前这里只发 QQ、不写日志：出问题时 bridge.log 里什么都没有，排查只能靠猜（PR #24）。
                 log(`⚠️ agent 处理出错 (${key})：${safeMsg}`);
                 appendActivity(`${key} agent 处理出错：${safeMsg.slice(0, 80)}`);
-                await sendToQQ(key, `⚠️ agent 处理出错：${safeMsg}`);
+                // 以前这里直接把「⚠️ agent 处理出错：…」发到 QQ，球球看到的就是一句机器话，
+                // 有时还会跟着她自己的「卡了/没看到」解释。现在改成：先自动重试一次，
+                // 真的连续失败两次才用一句人话说一声（不是技术报错）。
+                const retryCount = (agentErrorRetries.get(key) || 0) + 1;
+                agentErrorRetries.set(key, retryCount);
+                const hasUnread = (getSocialV2State(key).unread || []).length > 0;
+                if (hasUnread && retryCount <= 2) {
+                  log(`[reserved2] ${key} 出错后自动重试（第 ${retryCount} 次），40 秒后再叫她`);
+                  setTimeout(() => {
+                    try { sendWakePromptV2(key, 'retryAfterError'); } catch (error) { log(`重试唤醒失败: ${error?.message ?? error}`); }
+                  }, 40000 + retryCount * 20000);
+                } else if (retryCount >= 2) {
+                  agentErrorRetries.delete(key);
+                  await sendToQQ(key, '刚才这边断了一下，你再说一遍？');
+                }
                 if (isFarewell) {
                   const st = socialState(key);
                   if (st.phase === 'exiting') {
