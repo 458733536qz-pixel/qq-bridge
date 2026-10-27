@@ -3850,6 +3850,10 @@ async function main() {
             sendJson({ ok: false, error: 'TTS配置和密钥仅控制台可用' }, 403); return;
           }
           try {
+            if (req.method === 'GET' && url.pathname === '/api/tts/presets') { sendJson({ ok: true, ...tts.presets() }); return; }
+            if (req.method === 'POST' && url.pathname === '/api/tts/preset-save') { sendJson({ ok: true, ...tts.savePreset(await readBody()) }); return; }
+            if (req.method === 'POST' && url.pathname === '/api/tts/preset-apply') { sendJson({ ok: true, ...tts.applyPreset(await readBody()) }); return; }
+            if (req.method === 'POST' && url.pathname === '/api/tts/preset-preview') { sendJson({ ok: true, ...await tts.previewPreset(await readBody()) }); return; }
             if (req.method === 'GET' && url.pathname === '/api/tts/settings') {
               sendJson({ ok: true, ...tts.view(url.searchParams.get('model') || undefined), knownModels: MIMO_MODELS }); return;
             }
@@ -11220,22 +11224,27 @@ async function main() {
         saveSocialV2State();
       }
     } catch { /* 没有就算了 */ }
+    // 最近一条他发来的消息：下面【人设细节】召回、【此刻状态】和冷库召回都要用，
+    // 所以先取出来（以前在 continuity 之后才定义，导致 engaged 判断拿不到它）。
+    const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     let continuityLine = '';
     if (continuity) {
       try {
         const cf = path.join(os.homedir(), '.bili-ai', 'continuity', 'state.json');
         let cs = continuity.loadState(cf);
-        cs = continuity.tickBehavior(cs, Date.now(), {});
-        continuity.saveState(cf, cs);
         // behaviorLine/eventsLine 自己已经带【】了，不要再套一层（原来会拼成
         // `…休息】【【待跟进】暂无】` 这种坏括号）；标题也换成【她此刻】，
         // 避免和下面 statusLine 的【此刻状态】撞名。
+        // 他刚发消息（10 分钟内）时，别让她显示「正忙着」——那是她回得冷淡的现成借口。
+        const recentlyMessaged = Boolean(lastMsg && Number.isFinite(Number(lastMsg.time))
+          && Date.now() - Number(lastMsg.time) < 10 * 60 * 1000);
+        cs = continuity.tickBehavior(cs, Date.now(), { engaged: recentlyMessaged });
+        continuity.saveState(cf, cs);
         const b = continuity.behaviorLine(cs).replace(/^【此刻状态】/, '【她此刻】');
         const e = continuity.eventsLine(cs, Date.now());
         continuityLine = `${b}\n${e}\n\n`;
       } catch { /* 状态读不到就不注入 */ }
     }
-    const lastMsg = [...(Array.isArray(st.recentMessages) ? st.recentMessages : [])].reverse().find((m) => m && !m.isSelf);
     // 冷热记忆：只在他这句话带着线索（人名/地名/物品/时间）时去冷库翻，最多 3 条
     let recallLine = '';
     try {

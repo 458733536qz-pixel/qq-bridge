@@ -44,6 +44,7 @@
     "test:album-photo": "node scripts/test-album-photo.mjs",
     "test:provider-pick": "node --test scripts/test-provider-pick.mjs",
     "test:error-redact": "node scripts/test-error-redact.mjs",
+    "test:mood": "node scripts/test-mood.mjs",
     "test:sysemoji-face": "node scripts/test-sysemoji-face.mjs",
     "preview:console": "node scripts/console-ui-fixture.mjs",
     "verify:adaptation": "node scripts/verify-dsh-021-adaptation.mjs",
