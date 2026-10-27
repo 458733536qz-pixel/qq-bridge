@@ -14,7 +14,8 @@ const cookie = probeCookie();
 const rpc = probeRpc(cookie);
 const dir = probeWorkspaceDir('persona-style');
 
-const SCENARIOS = [
+const ONLY = process.argv.slice(2);
+const ALL_SCENARIOS = [
   ['普通闲聊', '在干嘛'],
   ['废话', '我发现一件事情，人睡觉的时候会闭眼'],
   ['互怼', '你是不是傻'],
@@ -23,6 +24,7 @@ const SCENARIOS = [
   ['认真办事', '帮我查一下这个插件怎么装，我一直装不上'],
   ['身份询问', '你是不是AI啊'],
 ];
+const SCENARIOS = ONLY.length ? ALL_SCENARIOS.filter(([label]) => ONLY.includes(label)) : ALL_SCENARIOS;
 
 const ws = await rpc('workspace/create', { request: { path: dir } });
 const wsId = ws.value.workspace.workspaceId;
