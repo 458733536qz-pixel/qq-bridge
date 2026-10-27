@@ -19,7 +19,7 @@ import yaml from 'js-yaml';
 import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
 import { GEN1_ROLE_LINE_RE, findRecallSection, parseRoleSections, pickRecallSections, recallSectionIndex, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
 import { affinityPromptSection, levelOf, readAffinity, tickAffinity } from './affinity.js';
-import { moodDeltaFromText, moodPromptLine, nudgeMood } from './mood.js';
+import { currentMood, moodDeltaFromText, moodPromptLine, nudgeMood } from './mood.js';
 import { pickProvider } from './provider-pick.js';
 import { archiveMessage, recallByCue } from './memory-cool.js';
 import { compactSharedMemory, compactCrossLog } from './prompt-context.js';
@@ -3735,7 +3735,8 @@ async function main() {
         return crypto.timingSafeEqual(a, b);
       })();
       // 桌面挂饰读好感度：只读、只回分数，走单独的公开 GET（挂饰在 DSH 页面里，拿不到控制台令牌）。
-      const publicAffinityRead = req.method === 'GET' && url.pathname === '/api/affinity/summary';
+      const publicAffinityRead = req.method === 'GET'
+        && (url.pathname === '/api/affinity/summary' || url.pathname === '/api/affinity/recent');
       if (consoleToken && !tokenMatches && !publicAffinityRead) {
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
@@ -3877,6 +3878,8 @@ async function main() {
           }
           try {
             if (req.method === 'GET' && url.pathname === '/api/tts/presets') { sendJson({ ok: true, ...tts.presets() }); return; }
+            if (req.method === 'POST' && url.pathname === '/api/tts/gsv-upload') { sendJson({ ok: true, ...await tts.uploadGsvFile({filename:url.searchParams.get('name'),stream:req}) }); return; }
+            if (req.method === 'POST' && url.pathname === '/api/tts/gsv-import') { sendJson({ ok: true, ...await tts.importGsvVoice(await readBody()) }); return; }
             if (req.method === 'POST' && url.pathname === '/api/tts/preset-save') { sendJson({ ok: true, ...tts.savePreset(await readBody()) }); return; }
             if (req.method === 'POST' && url.pathname === '/api/tts/preset-apply') { sendJson({ ok: true, ...tts.applyPreset(await readBody()) }); return; }
             if (req.method === 'POST' && url.pathname === '/api/tts/preset-preview') { sendJson({ ok: true, ...await tts.previewPreset(await readBody()) }); return; }
@@ -4098,6 +4101,29 @@ async function main() {
         // 桌面挂饰（~/.dsh/plugins/dsh-feiyu-mood）在 DSH 页面里，读不到本地文件；
         // 这里给一个**只读、只回分数**的接口，并只允许本机回环页面跨域读。
         // 真源仍是 ~/.bili-ai/affinity.json（QQ / B站 / 挂饰三边同一个数字）。
+        // 她最近的动静（cross-log 尾部）：挂饰的「记录」页用，只给本机回环页面读。
+        if (req.method === 'GET' && url.pathname === '/api/affinity/recent') {
+          try {
+            const origin = String(req.headers.origin ?? '');
+            try {
+              const u = new URL(origin);
+              if (u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '[::1]') {
+                res.setHeader('Access-Control-Allow-Origin', origin);
+                res.setHeader('Vary', 'Origin');
+              }
+            } catch { /* 无 Origin */ }
+            const limit = Math.max(1, Math.min(40, Number(url.searchParams.get('limit')) || 20));
+            const lines = fs.readFileSync(CROSS_LOG_FILE, 'utf8').split('\n').filter(Boolean).slice(-limit);
+            const items = lines.map((line) => {
+              const m = /^-\s*(\d{2}-\d{2})\s+(\d{2}:\d{2})\s+\[([^\]]+)\]\s*(.+)$/.exec(line.trim());
+              return m ? { date: m[1], time: m[2], source: m[3], text: m[4] } : { date: '', time: '', source: '', text: line.trim() };
+            });
+            sendJson({ ok: true, count: items.length, items });
+          } catch (error) {
+            sendJson({ ok: false, error: `读不到她的记录：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/affinity/summary') {
           try {
             const origin = String(req.headers.origin ?? '');
@@ -4113,12 +4139,29 @@ async function main() {
               res.setHeader('Vary', 'Origin');
             }
             const rec = readAffinity(AFFINITY_FILE, cfg.ownerQQ ? `private:${cfg.ownerQQ}` : 'private:0');
+            // 顺便把她此刻的真实状态也带上：挂饰原来只显示它自己算的「心情」，
+            // 和她的生活没关系（记录永远是空的）。这里给的是 QQ 桥的真实状态。
+            let mood = null;
+            try {
+              const m = currentMood(Date.now());
+              mood = { score: m.score, label: m.label, reason: m.reason || '' };
+            } catch { /* 读不到就不带 */ }
+            let state = null;
+            try {
+              if (continuity) {
+                const cs = continuity.loadState(path.join(os.homedir(), '.bili-ai', 'continuity', 'state.json'));
+                const ticked = continuity.tickBehavior(cs, Date.now(), { engaged: true });
+                state = { energy: ticked.energy, busy: !!ticked.busy, activity: String(ticked.activity || '') };
+              }
+            } catch { /* 没有连续性模块就不带 */ }
             sendJson({
               ok: true,
               score: rec.score,
               level: rec.level,
               levelIndex: rec.levelIndex,
-              updatedAt: Number(rec.updatedAt) || 0
+              updatedAt: Number(rec.updatedAt) || 0,
+              mood,
+              state
             });
           } catch (error) {
             sendJson({ ok: false, error: `读好感度失败：${error?.message ?? error}` }, 500);
