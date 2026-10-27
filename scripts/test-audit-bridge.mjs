@@ -172,14 +172,14 @@ await test('malformed HTTP request targets return 400 without hanging', async (h
       assert.throws(() => h.resolveVoicePathForV2(bad), /不接受|只能/, `AI 传 ${bad.split(':')[0]} 来源被拒`);
     }
 
-    // 4) 真发一条（虚拟网关）：必须是 record 段、且 file 指向库内文件
+    // 4) 真发一条（虚拟网关）：必须内联经库内校验的实际音频字节，容器无法访问宿主绝对路径
     const sent = await h.sendVoiceForV2('group:456', 'hello.mp3', { readback: false });
     const call = h.calls.http.find((c) => c.url.endsWith('/send_group_msg'));
     assert.ok(call, '语音走 send_group_msg');
     assert.equal(call.body.group_id, 456, '语音发给正确群');
     assert.equal(call.body.message.length, 1, '语音只发一个段');
     assert.equal(call.body.message[0].type, 'record', '段类型是 record');
-    assert.equal(call.body.message[0].data.file, path.join(audioDir, 'hello.mp3'), 'record 段指向库内绝对路径');
+    assert.equal(call.body.message[0].data.file, 'base64://' + fs.readFileSync(path.join(audioDir, 'hello.mp3')).toString('base64'), 'record 段内联库内音频原始字节');
     assert.equal(sent.messageId, 9001, '返回网关 message_id');
     assert.equal(sent.readback, null, '显式关掉回读时不调 fetch_ptt_text');
 

@@ -201,3 +201,18 @@ test('each reply-wait buffer obeys its own tool switch, never the other one', ()
   assert.deepEqual(r3.data.newMessages, []);
   assert.equal(r3.data.readThroughSeq, 5, 'a message nobody was allowed to see may not advance the watermark');
 }));
+
+test('opt-in unanswered-message guard infers a reply wait only when purpose is omitted', () => fixture(async ({ h, key, st, request, append }) => {
+  append('完整的问题是什么');st.lastIncomingAt=Date.now()-10000;
+  const inferred=await request('wait',{timeoutMs:1200,quietMs:100});
+  assert.equal(inferred.data.purpose,'reply');assert.ok(inferred.data.waitedMs<500);assert.equal(inferred.data.preSleepWaitSatisfied,false);
+  const explicit=await request('wait',{purpose:'messages',timeoutMs:100,quietMs:100});
+  assert.equal(explicit.data.purpose,'messages');assert.equal(explicit.data.timeout,true);
+  st.lastAiReplyAt=Date.now();
+  const answered=await request('wait',{timeoutMs:100,quietMs:100});assert.equal(answered.data.purpose,'messages');
+}, {wait:{minMs:100,maxMs:600000,minQuietAfterNewMs:100,inferReplyBeforeResponse:true}}));
+
+test('configured reply quiet cap prevents repeated long quiet checks without changing sleep waits',()=>fixture(async({st,request,append})=>{
+ append('完整问题');st.lastIncomingAt=Date.now()-500;
+ const r=await request('wait',{purpose:'reply',quietMs:10000,timeoutMs:1200});assert.equal(r.data.quietMs,100);assert.ok(r.data.waitedMs<500);
+},{wait:{minMs:100,maxMs:600000,minQuietAfterNewMs:100,replyMaxQuietMs:100}}));
