@@ -3734,7 +3734,9 @@ async function main() {
         if (a.length !== b.length) return false;
         return crypto.timingSafeEqual(a, b);
       })();
-      if (consoleToken && !tokenMatches) {
+      // 桌面挂饰读好感度：只读、只回分数，走单独的公开 GET（挂饰在 DSH 页面里，拿不到控制台令牌）。
+      const publicAffinityRead = req.method === 'GET' && url.pathname === '/api/affinity/summary';
+      if (consoleToken && !tokenMatches && !publicAffinityRead) {
         if (req.method === 'GET' && url.pathname === '/') {
           res.writeHead(401, { 'content-type': 'text/html; charset=utf-8', ...SECURITY_HEADERS });
           res.end('<!doctype html><meta charset="utf-8"><title>需要令牌</title><script>const t=prompt(\'请输入控制台访问令牌\');if(t)location.href=\'/?token=\'+encodeURIComponent(t);</script>');
@@ -4092,6 +4094,37 @@ async function main() {
           return;
         }
         // ── 人格管理 ──────────────────────────────────────────────────────────
+        // ── 好感度摘要（给 DSH 里的「大肥鱼挂饰」读）────────────────────
+        // 桌面挂饰（~/.dsh/plugins/dsh-feiyu-mood）在 DSH 页面里，读不到本地文件；
+        // 这里给一个**只读、只回分数**的接口，并只允许本机回环页面跨域读。
+        // 真源仍是 ~/.bili-ai/affinity.json（QQ / B站 / 挂饰三边同一个数字）。
+        if (req.method === 'GET' && url.pathname === '/api/affinity/summary') {
+          try {
+            const origin = String(req.headers.origin ?? '');
+            let allowed = '';
+            try {
+              const u = new URL(origin);
+              if (u.hostname === '127.0.0.1' || u.hostname === 'localhost' || u.hostname === '[::1]' || u.hostname === '::1') {
+                allowed = origin;
+              }
+            } catch { /* 没有 Origin（curl/同源）就不加允许头 */ }
+            if (allowed) {
+              res.setHeader('Access-Control-Allow-Origin', allowed);
+              res.setHeader('Vary', 'Origin');
+            }
+            const rec = readAffinity(AFFINITY_FILE, cfg.ownerQQ ? `private:${cfg.ownerQQ}` : 'private:0');
+            sendJson({
+              ok: true,
+              score: rec.score,
+              level: rec.level,
+              levelIndex: rec.levelIndex,
+              updatedAt: Number(rec.updatedAt) || 0
+            });
+          } catch (error) {
+            sendJson({ ok: false, error: `读好感度失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
         if (req.method === 'GET' && url.pathname === '/api/roles') {
           const rs = readRoleState();
           const summaries = roleSummaries();
