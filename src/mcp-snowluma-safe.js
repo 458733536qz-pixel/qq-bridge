@@ -344,6 +344,8 @@ const TOOL_CONFIG_FLAGS = {
   qq_send_sticker: 'sendSticker',
   qq_collect_sticker: 'collectSticker',
   qq_get_self_image: 'getSelfImage',
+  qq_list_self_photos: 'listPhotos',
+  qq_send_self_photo: 'sendPhoto',
   qq_sticker_note: 'stickerNote',
   qq_set_sticker_remark: 'setStickerRemark',
 };
@@ -1290,6 +1292,55 @@ if (cfg.socialV2?.tools?.getSelfImage !== false) {
         };
       } catch (error) {
         return { content: [{ type: 'text', text: `获取形象图片失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.listPhotos !== false || cfg.socialV2?.tools?.sendPhoto !== false) {
+  server.tool(
+    'qq_list_self_photos',
+    '查看相册里你自己的照片（文件名 + 一句话说明）。被问「你长什么样 / 有照片吗」、或你想主动发一张自己的照片之前，先用这个挑一张；挑好了用 qq_send_self_photo 真发出去。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      sub: z.enum(['self', 'likes']).optional().describe('self=我自己的样子（默认），likes=我存的喜欢的图')
+    },
+    async ({ key, token, sub }) => {
+      try {
+        const q = new URLSearchParams({ key });
+        if (sub) q.set('sub', sub);
+        const data = await agentApi(`/api/socialV2/album?${q.toString()}`, { headers: { 'x-agent-token': token } });
+        return { content: [{ type: 'text', text: serializeModelData(data) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `查看相册失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
+
+if (cfg.socialV2?.tools?.sendPhoto !== false) {
+  server.tool(
+    'qq_send_self_photo',
+    '把相册里的一张你自己的照片真发出去（不是描述长相）。一条消息只能一张、不能附带文字：想说的话先用 qq_send_message 单独发一句，再单独发照片。只在被要照片、或聊到长相/穿搭/去哪里玩这种自然场合用，别刷；被拒过一次就别连着要发。',
+    {
+      key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+      token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+      photo: z.string().describe('照片文件名或列表序号（先用 qq_list_self_photos 挑）'),
+      sub: z.enum(['self', 'likes']).optional().describe('self=我自己的样子（默认），likes=我存的好看图'),
+      replyToMessageId: z.number().optional().describe('可选：引用某条消息（消息 id）')
+    },
+    async ({ key, token, photo, sub, replyToMessageId }) => {
+      try {
+        const body = JSON.stringify({ key, photo, ...(sub ? { sub } : {}), ...(replyToMessageId !== undefined ? { replyToMessageId } : {}) });
+        const data = await agentApi('/api/socialV2/send-photo', {
+          method: 'POST',
+          headers: { 'x-agent-token': token, 'content-type': 'application/json' },
+          body
+        });
+        return { content: [{ type: 'text', text: serializeModelData(data) }], isError: data?.ok === false };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `发照片失败：${error?.message ?? error}` }], isError: true };
       }
     }
   );

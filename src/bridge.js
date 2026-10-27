@@ -131,6 +131,48 @@ function extractEventMarkers(input) {
   return { text: text.replace(/\n{3,}/g, '\n\n').trim(), items, closes };
 }
 
+/** 从消息里摘出 [照片] 序号/文件名（空 = 让她自己挑一张） */
+function extractPhotoMarkers(input) {
+  const items = [];
+  let text = String(input ?? '');
+  const re = /\[\s*照片\s*\]([^\[\n]{0,60})/g;
+  text = text.replace(re, (_, body) => {
+    items.push(String(body || '').replace(/^[:：\s]+/, '').trim());
+    return '';
+  });
+  return { text: text.replace(/\n{3,}/g, '\n\n').trim(), items };
+}
+
+/**
+ * 统一处理她要发出去的文本里带的标记：日记 / 事件 / 照片。
+ * 返回去掉标记后的文本与待发照片。几条发送路径（send-message / send-burst）共用，
+ * 否则 [照片] 会原样发到 QQ 里——那是球球能直接看见的 bug，不能赌她会走哪条路。
+ */
+function processOutgoingMarkers(messages) {
+  const photoMarkers = [];
+  const cleaned = [];
+  const diaryItems = [];
+  const eventItems = [];
+  const eventCloses = [];
+  let stripped = false;
+  for (const m of messages) {
+    const r = extractDiaryMarkers(m);
+    if (r.diary.length) stripped = true;
+    diaryItems.push(...r.diary);
+    const ev = extractEventMarkers(r.text);
+    if (ev.items.length || ev.closes.length || ev.text !== r.text) stripped = true;
+    eventItems.push(...ev.items);
+    eventCloses.push(...ev.closes);
+    const ph = extractPhotoMarkers(ev.text);
+    if (ph.items.length || ph.text !== ev.text) stripped = true;
+    photoMarkers.push(...ph.items);
+    if (ph.text) cleaned.push(ph.text);
+  }
+  if (eventItems.length || eventCloses.length) recordEventItems(eventItems, eventCloses);
+  if (diaryItems.length) recordDiaryItems(diaryItems);
+  return { cleaned, photoMarkers, stripped, diaryCount: diaryItems.length };
+}
+
 function recordEventItems(items, closes) {
   if (!continuity) return;
   if (!items.length && !closes.length) return;
@@ -2029,6 +2071,172 @@ async function main() {
   }
 
   // 发送一个收藏表情（按 emoji_id/url/md5 解析，发图片段）。
+  // ── 相册：她自己的照片（发送用）────────────────────────────────────────
+  // 在此之前工具面里只有 qq_get_self_image（看默认 Q 版形象），没有**发照片**的路：
+  // 人设写着「要照片就从相册挑一张」，她只能说「我发你一张」然后什么也发不出去。
+  // 这里补真正的发送路径，并且只读 ~/.bili-ai/album-real 下白名单子目录里的图片，
+  // 文件名必须是纯 basename（resolve 后再校验前缀，防目录穿越）。
+  const ALBUM_DIR = path.join(os.homedir(), '.bili-ai', 'album-real');
+  const ALBUM_SUBDIRS = new Set(['self', 'likes']);
+  const ALBUM_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
+  const ALBUM_MAX_BYTES = 8 * 1024 * 1024;
+
+  // index.md 里写着每张照片的一句话说明：`- \`01-xx.jpg\` — 灰白针织开衫…`
+  function albumCaptions() {
+    const map = new Map();
+    try {
+      const text = fs.readFileSync(path.join(ALBUM_DIR, 'index.md'), 'utf8');
+      for (const line of text.split('\n')) {
+        const m = /^-\s*`([^`]+)`\s*[—–-]+\s*(.+)$/.exec(line.trim());
+        if (m) map.set(m[1].trim(), m[2].trim());
+      }
+    } catch { /* 没有 index 就只给文件名 */ }
+    return map;
+  }
+
+  function albumPhotos(sub = 'self') {
+    const dir = ALBUM_SUBDIRS.has(sub) ? sub : 'self';
+    const base = path.join(ALBUM_DIR, dir);
+    let names = [];
+    try {
+      names = fs.readdirSync(base)
+        .filter((f) => ALBUM_EXTS.has(path.extname(f).toLowerCase()) && !f.startsWith('.'))
+        .sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+    } catch { return []; }
+    const captions = albumCaptions();
+    return names.map((name) => {
+      let bytes = 0;
+      try { bytes = fs.statSync(path.join(base, name)).size; } catch { bytes = 0; }
+      return { name, dir, bytes, caption: captions.get(name) || '' };
+    }).filter((item) => item.bytes > 0 && item.bytes <= ALBUM_MAX_BYTES);
+  }
+
+  function resolveAlbumPhoto(photoRef, sub = 'self') {
+    const dir = ALBUM_SUBDIRS.has(sub) ? sub : 'self';
+    const raw = String(photoRef ?? '').trim();
+    if (!raw) throw new Error('照片名不能为空；先用 qq_list_self_photos 看有哪些');
+    // 允许只给序号（1 开始）或省略扩展名，方便她按列表顺序挑。
+    const photos = albumPhotos(dir);
+    let hit = photos.find((item) => item.name === raw);
+    if (!hit) {
+      const base = raw.replace(/\.[A-Za-z0-9]+$/, '');
+      hit = photos.find((item) => item.name.replace(/\.[A-Za-z0-9]+$/, '') === base)
+        ?? photos.find((item) => item.name.includes(raw));
+    }
+    if (!hit && /^\d{1,2}$/.test(raw)) hit = photos[Number(raw) - 1];
+    if (!hit) throw new Error(`相册里没有「${raw}」；可用：${photos.map((p) => p.name).join('、') || '（空）'}`);
+    const file = path.join(ALBUM_DIR, dir, path.basename(hit.name));
+    const resolved = path.resolve(file);
+    if (!resolved.startsWith(path.resolve(path.join(ALBUM_DIR, dir)) + path.sep)) {
+      throw new Error('照片路径不合法');
+    }
+    return { ...hit, file: resolved };
+  }
+
+  const ALBUM_MIME = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif' };
+
+  async function sendPhotoV2(key, photoRef, options = {}) {
+    const assertSendAllowed = captureSendGuard(key);
+    const photo = resolveAlbumPhoto(photoRef, options.sub);
+    const buffer = fs.readFileSync(photo.file);
+    if (!buffer.length) throw new Error(`照片 ${photo.name} 是空文件`);
+    if (buffer.length > ALBUM_MAX_BYTES) throw new Error(`照片 ${photo.name} 太大（${buffer.length} 字节）`);
+    const [kind, id] = key.split(':');
+    const segments = [];
+    const replyToMessageId = options.replyToMessageId;
+    const atUserId = options.atUserId;
+    if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '') {
+      const rid = String(replyToMessageId).trim();
+      if (!/^-?[1-9]\d*$/.test(rid)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
+      segments.push({ type: 'reply', data: { id: rid } });
+    }
+    if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
+      const at = String(atUserId).trim();
+      if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
+      segments.push({ type: 'at', data: { qq: at } });
+    }
+    // 和发表情同一条规矩：一条消息只能是**一张图**，不能在同一气泡里附带文字说明。
+    segments.push({ type: 'image', data: { file: 'base64://' + buffer.toString('base64') } });
+    const params = kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments };
+    const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+    const httpUrl = String(cfg.snowluma?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+    let sendResolve;
+    let sendReject;
+    const sendResult = new Promise((resolve, reject) => { sendResolve = resolve; sendReject = reject; });
+    sendChain = sendChain.then(async () => {
+      try {
+        // 发照片比发表情更像「翻相册找一张」，停顿给足一点。
+        await sleep(randInt(1200, 2600));
+        assertSendAllowed();
+        const res = await fetch(`${httpUrl}/${action}`, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            ...(cfg.snowluma?.accessToken ? { authorization: `Bearer ${cfg.snowluma.accessToken}` } : {})
+          },
+          body: JSON.stringify(params),
+          signal: AbortSignal.timeout(20000)
+        });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+          throw new Error(`OneBot ${action} 失败: ${body.wording || body.retcode || res.status}`);
+        }
+        sendResolve(body.data);
+      } catch (error) {
+        sendReject(error);
+      }
+    });
+    const data = await sendResult;
+    return { photo, messageId: data?.message_id ?? null };
+  }
+
+  // 把「我刚发了一张照片」写进二代会话的 recentMessages，她才记得自己发过什么。
+  function recordSentPhotoV2(key, photo, messageId) {
+    const st = getSocialV2State(key);
+    const label = photo.caption || photo.name;
+    st.recentMessages.push({
+      messageId: messageId ? String(messageId) : null,
+      sender: '我',
+      text: truncateText(`[照片:${label}]`, 200),
+      plain: truncateText(`[照片:${label}]`, 200),
+      quoteTargetIsSelf: false,
+      isOwner: true,
+      ownerLabel: '我',
+      isSelf: true,
+      media: [],
+      hasMedia: true,
+      forwardIds: [],
+      hasForward: false,
+      photo: { name: photo.name, dir: photo.dir, caption: photo.caption },
+      time: Date.now()
+    });
+    const recentLimit = Number(cfg.socialV2?.context?.recentLimit) || 100;
+    if (st.recentMessages.length > recentLimit) st.recentMessages.splice(0, st.recentMessages.length - recentLimit);
+    saveSocialV2State();
+    return st;
+  }
+
+  // 消息里写了 [照片] 的批量发送（一次最多两张，失败只记日志，不打断说话）。
+  async function sendPendingPhotosV2(key, items) {
+    const results = [];
+    const photos = albumPhotos('self');
+    for (const ref of items.slice(0, 2)) {
+      const pick = ref || (photos.length ? photos[Math.floor(Math.random() * photos.length)].name : '');
+      try {
+        if (!pick) throw new Error('相册是空的');
+        const sent = await sendPhotoV2(key, pick, {});
+        recordSentPhotoV2(key, sent.photo, sent.messageId);
+        results.push({ ok: true, name: sent.photo.name, caption: sent.photo.caption });
+        log(`[album] 标记发照片 ${key}: ${sent.photo.name}`);
+        appendActivity(`${key} [album] 标记发照片：${sent.photo.name}`);
+      } catch (error) {
+        results.push({ ok: false, ref, error: String(error?.message ?? error) });
+        log(`[album] 标记发照片失败 ${key} (${ref || '随机'}): ${error?.message ?? error}`);
+      }
+    }
+    return results;
+  }
+
   async function sendStickerV2(key, stickerRef, options = {}) {
     const assertSendAllowed = captureSendGuard(key);
     // 发送前强制同步一次，确保“刚新增的表情能立即用、刚删除的表情不会继续发”。
@@ -4699,7 +4907,7 @@ async function main() {
             merged.autoReplyCheckMs = Number.isFinite(n) ? Math.max(1000, Math.round(n)) : (current.autoReplyCheckMs ?? 30000);
           }
           // tools：只接受布尔开关
-          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice'];
+          const toolFlags = ['getPrompt', 'getUnread', 'getRecent', 'socialState', 'sendGroup', 'sendPrivate', 'reply', 'sendBurst', 'sendMessage', 'waitMessages', 'feedback', 'getMyRecent', 'getMessageDetail', 'getActiveMembers', 'setWakeConfig', 'markRead', 'memory', 'slangQuery', 'slangSubmit', 'getImages', 'getForwardMsg', 'sendPoke', 'listStickers', 'getStickerImage', 'sendSticker', 'setStickerRemark', 'stickerNote', 'collectSticker', 'getSelfImage', 'sendVoice', 'listPhotos', 'sendPhoto'];
           if (body.tools && typeof body.tools === 'object') {
             merged.tools = { ...(current.tools ?? {}), ...body.tools };
             for (const k of toolFlags) {
@@ -4971,6 +5179,8 @@ async function main() {
             stickerNote: 'qq_sticker_note',
             collectSticker: 'qq_collect_sticker',
             getSelfImage: 'qq_get_self_image',
+            listPhotos: 'qq_list_self_photos',
+            sendPhoto: 'qq_send_self_photo',
             sendVoice: 'qq_send_voice / qq_list_voices'
           };
           const tools = cfg.socialV2?.tools ?? {};
@@ -5450,6 +5660,25 @@ async function main() {
             // 先预占发送额度，避免并发绕过限频
             for (let i = 0; i < messages.length; i++) st.sendTimes.push(now);
             if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            // 分条发送同样要摘掉 [日记]/[事件]/[照片]（放在这里是因为上面那段配额预占
+            // 按原条数算的；少发几条只会多占一点额度，下一分钟自然过期）。
+            const burstMarked = processOutgoingMarkers(messages);
+            const burstPhotos = burstMarked.photoMarkers;
+            if (burstMarked.stripped) {
+              messages.length = 0;
+              messages.push(...burstMarked.cleaned);
+            }
+            if (!messages.length && !burstPhotos.length) {
+              sendJson({ ok: true, sent: [], diary: burstMarked.diaryCount, note: '只做了记录，没有要发的话' });
+              return;
+            }
+            if (!messages.length) {
+              const photos = await sendPendingPhotosV2(key, burstPhotos);
+              const okCount = photos.filter((one) => one.ok).length;
+              if (okCount) scheduleReplyCheckV2(key);
+              sendJson({ ok: true, key, sent: 0, photos, note: okCount ? '只发了照片' : '照片没发出去' });
+              return;
+            }
             const delays = computeGapsV2(messages, 'auto', undefined, undefined, sendCfg);
             const sentMessages = await sendMessagesV2(key, messages, delays);
             recordSentMessagesV2(key, sentMessages);
@@ -5460,10 +5689,12 @@ async function main() {
             log(`[reserved2] 工具分条发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
             appendActivity(`${key} [reserved2] 工具分条发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
+            const burstPhotoResults = burstPhotos.length ? await sendPendingPhotosV2(key, burstPhotos) : [];
+            if (burstPhotoResults.some((one) => one.ok)) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, ...(burstPhotoResults.length ? { photos: burstPhotoResults } : {}), ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -5567,30 +5798,24 @@ async function main() {
               return;
             }
           }
-          // 日记标记：先摘出来写进日记，再走原来的发送校验（正文里不留标记）
-          {
-            const cleaned = [];
-            const diaryItems = [];
-            const eventItems = [];
-            const eventCloses = [];
-            for (const m of messages) {
-              const r = extractDiaryMarkers(m);
-              diaryItems.push(...r.diary);
-              const ev = extractEventMarkers(r.text);
-              eventItems.push(...ev.items);
-              eventCloses.push(...ev.closes);
-              if (ev.text) cleaned.push(ev.text);
-            }
-            if (eventItems.length || eventCloses.length) recordEventItems(eventItems, eventCloses);
-            if (diaryItems.length) {
-              recordDiaryItems(diaryItems);
-              messages.length = 0;
-              messages.push(...cleaned);
-            }
-            if (!messages.length) {
-              sendJson({ ok: true, sent: [], diary: diaryItems.length, note: '只记了日记，没有要发的话' });
-              return;
-            }
+          // 日记/事件/照片标记：先摘出来处理，再走原来的发送校验（正文里不留标记）
+          const marked = processOutgoingMarkers(messages);
+          const photoMarkers = marked.photoMarkers;
+          if (marked.stripped) {
+            messages.length = 0;
+            messages.push(...marked.cleaned);
+          }
+          if (!messages.length && !photoMarkers.length) {
+            sendJson({ ok: true, sent: [], diary: marked.diaryCount, note: '只做了记录，没有要发的话' });
+            return;
+          }
+          // 只有照片没有文字：直接发照片，不必走文本发送的限频/引用解析。
+          if (!messages.length) {
+            const photos = await sendPendingPhotosV2(key, photoMarkers);
+            const okCount = photos.filter((one) => one.ok).length;
+            if (okCount) scheduleReplyCheckV2(key);
+            sendJson({ ok: true, key, sent: 0, photos, note: okCount ? '只发了照片' : '照片没发出去' });
+            return;
           }
           try { for (const m of messages) archiveMessage({ key, self: true, text: m }); } catch { /* 归档失败不影响发送 */ }
           const delays = computeGapsV2(messages, gapMode, gapMs, gaps, sendCfg);
@@ -5636,10 +5861,13 @@ async function main() {
             if (sentMessages.length > 0) appendCrossLog('QQ', messages.join(' / '));
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
+            // 文字发完再发照片（真人也是先说话再翻相册），失败只记日志，不打断说话。
+            const photoResults = photoMarkers.length ? await sendPendingPhotosV2(key, photoMarkers) : [];
+            if (photoResults.some((one) => one.ok)) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
             const spaceWarn = findCjkSpaceWarning(messages);
             const splitWarn = findSplitBoundaryWarning(messages);
-            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
+            sendJson({ ok: true, key, sent: sentMessages.length, failed: messages.length - sentMessages.length, delays, quoted: quotedInfo, ...(photoResults.length ? { photos: photoResults } : {}), ...(burstHint ? { hint: burstHint } : {}), ...(spaceWarn ? { warn: spaceWarn } : {}), ...(splitWarn ? { splitWarn } : {}) });
           } catch (error) {
             if (error?.sent?.length) {
               recordSentMessagesV2(key, error.sent);
@@ -6142,6 +6370,93 @@ async function main() {
             saveSocialV2State();
             log(`[sticker] 工具发送表情失败 ${key}: ${error?.message ?? error}`);
             sendJson({ ok: false, error: `发送表情失败：${error?.message ?? error}` }, 500);
+          }
+          return;
+        }
+        // ── 相册：看她有哪些照片 / 发一张给她要的人 ────────────────────
+        if (req.method === 'GET' && url.pathname === '/api/socialV2/album') {
+          const key = String(url.searchParams.get('key') ?? '').trim();
+          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('listPhotos')) { sendJson({ ok: false, error: '工具未启用：qq_list_self_photos' }, 403); return; }
+          const sub = String(url.searchParams.get('sub') ?? 'self').trim();
+          const photos = albumPhotos(sub);
+          sendJson({
+            ok: true,
+            key,
+            dir: ALBUM_SUBDIRS.has(sub) ? sub : 'self',
+            total: photos.length,
+            photos: photos.slice(0, 20)
+          });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/socialV2/send-photo') {
+          const body = await readBody();
+          const key = String(body.key ?? '').trim();
+          const photo = String(body.photo ?? body.name ?? '').trim();
+          const sub = String(body.sub ?? 'self').trim();
+          const replyToMessageId = body.replyToMessageId;
+          const atUserId = body.atUserId ?? null;
+          if (!key || !photo) { sendJson({ ok: false, error: 'key 和 photo 不能为空' }, 400); return; }
+          // 和表情同一条仿真常识：一张图就是一条消息，不能在同一气泡里附带文字。
+          if (body.message || body.caption) {
+            sendJson({ ok: false, error: '照片消息不能附带文字；先把想说的话用 qq_send_message 发出去，再单独发照片' }, 400);
+            return;
+          }
+          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendPhoto')) { sendJson({ ok: false, error: '工具未启用：qq_send_self_photo' }, 403); return; }
+          if (currentMode !== 'reserved2') { sendJson({ ok: false, error: '该接口仅 reserved2 模式可用' }, 403); return; }
+          if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'reserved2 模式发送必须携带 agent token' }, 403); return; }
+          const keyMatch = /^(group|private):(\d+)$/.exec(key);
+          if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+          const kind = keyMatch[1];
+          const id = Number(keyMatch[2]);
+          if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfg, currentMode)) {
+            sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403);
+            return;
+          }
+          if (kind === 'private' && atUserId) { sendJson({ ok: false, error: '私聊不需要 @' }, 400); return; }
+          if (shouldBlockSilentReply(key)) { sendJson({ ok: false, error: '静默模式已开启，当前不允许发送' }, 403); return; }
+          if (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '' && !/^-?[1-9]\d*$/.test(String(replyToMessageId).trim())) {
+            sendJson({ ok: false, error: 'replyToMessageId 必须是非零整数（消息 id 可能为负数）' }, 400);
+            return;
+          }
+          const sendCfgPhoto = cfg.socialV2?.send ?? {};
+          const now = Date.now();
+          try {
+            const st = getSocialV2State(key);
+            const maxPerMinute = Number(sendCfgPhoto.maxSendPerMinute) || 0;
+            const maxPerHour = Number(sendCfgPhoto.maxSendPerHour) || 0;
+            const recentMinute = (st.sendTimes || []).filter((t) => now - t < 60000).length;
+            const recentHour = (st.sendTimes || []).filter((t) => now - t < 3600000).length;
+            if ((maxPerMinute > 0 && recentMinute + 1 > maxPerMinute) || (maxPerHour > 0 && recentHour + 1 > maxPerHour)) {
+              sendJson({ ok: false, error: '发送频率超限，请稍后再试' }, 429);
+              return;
+            }
+            st.sendTimes.push(now);
+            if (st.sendTimes.length > 500) st.sendTimes = st.sendTimes.slice(-500);
+            const sent = await sendPhotoV2(key, photo, { sub, replyToMessageId, atUserId });
+            recordSentPhotoV2(key, sent.photo, sent.messageId);
+            st.lastAiReplyAt = now;
+            st.lastActionAt = now;
+            st.wakeConfig.noActionCount = 0;
+            st.preSleepWaitSatisfiedAt = 0;
+            st.preSleepWaitObservedAt = 0;
+            st.preSleepWaitAccumMs = 0;
+            saveSocialV2State();
+            scheduleReplyCheckV2(key);
+            log(`[album] 工具发照片 ${key}: ${sent.photo.name}`);
+            appendActivity(`${key} [album] 工具发照片：${sent.photo.name}`);
+            sendJson({ ok: true, key, photo: { name: sent.photo.name, dir: sent.photo.dir, caption: sent.photo.caption }, sent: 1, failed: 0 });
+          } catch (error) {
+            const st = getSocialV2State(key);
+            const idx = st.sendTimes.indexOf(now);
+            if (idx >= 0) st.sendTimes.splice(idx, 1);
+            saveSocialV2State();
+            log(`[album] 工具发照片失败 ${key}: ${error?.message ?? error}`);
+            sendJson({ ok: false, error: `发照片失败：${error?.message ?? error}` }, 500);
           }
           return;
         }
@@ -10850,14 +11165,28 @@ async function main() {
     // 只带 1 节、≤700 字，触发词命中才带——这是「核心约束常驻、细节按需」的召回那一半。
     // 没命中就完全不加：绝不能让每轮都为「可能用得上」的细节付 token。
     let personaRecallLine = '';
+    const cueText = String(lastMsg?.text || lastMsg?.plain || '');
     try {
       const recallText = roleRecallContent();
-      const cue = String(lastMsg?.text || lastMsg?.plain || '');
-      if (recallText && cue) {
-        const picked = pickRecallSections(recallText, cue, { limit: 1, maxChars: 700 });
+      if (recallText && cueText) {
+        const picked = pickRecallSections(recallText, cueText, { limit: 1, maxChars: 700 });
         if (picked.text) personaRecallLine = `【人设细节】（他刚说到相关的，这里补一段；别的细节可以 qq_get_prompt 带 section 取）\n${picked.text}\n\n`;
       }
     } catch { /* 召回失败就当没有 */ }
+    // 【照片】相册是她的真照片（~/.bili-ai/album-real/self）。工具面上没有「发照片」的路时，
+    // 她只能嘴上说「我发你一张」——这里给她一条真能用的路：写 [照片] 序号，桥接替她发。
+    // 清单只在他要照片/聊长相时给（一张一行的清单每轮都带太贵）。
+    let photoLine = '';
+    try {
+      const album = albumPhotos('self');
+      if (album.length) {
+        const wantsPhoto = /照片|相片|自拍|长相|长什么样|发张|看看你|真人|长得/.test(cueText);
+        const digest = album.map((item, index) => `${index + 1}.${item.name.replace(/^\d+[-_]?/, '').replace(/\.[A-Za-z0-9]+$/, '')}`).join('、');
+        photoLine = wantsPhoto
+          ? `【照片】他在要照片／聊长相。相册里是你的这些照片：${digest}。想发就写 [照片] 序号（写 [照片] 让我自己挑一张），桥接会把那张真发出去、并从文字里删掉标记；一条一张。别只说“我发你一张”却什么都不发，也别用文字描述长相代替照片。\n\n`
+          : '【照片】想发一张自己的照片，就在话后单独写 [照片] 或 [照片] 序号（相册是你的真照片，桥接替你发出去并删掉标记）；一条一张，别只说“我发你一张”却不发。\n\n';
+      }
+    } catch { /* 相册读不到就不提 */ }
     const chatLifeLine = xiaolengChatContext({ key, text: String(lastMsg?.text || lastMsg?.plain || ''), channel: 'qq' });
     const lastAiMin = st.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(st.lastAiReplyAt)) / 60000)) : null;
     const statusBits = [`未读 ${(st.unread || []).length} 条`];
@@ -10889,7 +11218,7 @@ async function main() {
     const initialPromptLine = initialPromptText ? `${initialPromptText}\n\n` : '';
     // 时间感放在 base 的最末尾：紧接着就是【唤醒】原因与行动指令，位置最显眼。
     const timeSenseLine = buildTimeSenseLine(st) + (tts.read().enabled && tts.read().aiEnabled ? '\n【可合成语音】可用 qq_tts_send 把想说的话合成为语音条；delivery按本句情绪选择natural/warm/playful/comfort/quiet，保持固定音色，不每句叹气或轻笑；偶尔使用，verified=true才算QQ已回读。\n' : '');
-    const base = handoffLine + roleLine + affinityLine + moodLine + recallLine + personaRecallLine + continuityLine + identityLine + eventLine + diaryLine + burstLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + crossLogLine + sharedMemoryLine + participationLine + preSleepLine + timeSenseLine + chatLifeLine;
+    const base = handoffLine + roleLine + affinityLine + moodLine + recallLine + personaRecallLine + photoLine + continuityLine + identityLine + eventLine + diaryLine + burstLine + tokenLine + initialPromptLine + antiAiLine + proactiveLine + stickerLine + replyLine + statusLine + wakeLine + memoryLine + crossLogLine + sharedMemoryLine + participationLine + preSleepLine + timeSenseLine + chatLifeLine;
     // 唤醒原因里的那条消息本身多旧：`atMention@seq194` 这种形态能反查到原消息。
     const triggeredSeq = wakeReasonSeq(reason);
     const triggeredMsg = triggeredSeq ? findV2MessageBySeq(st, triggeredSeq) : null;

@@ -156,6 +156,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
     roleCoreContent, roleRecallContent, roleHintForMode, buildRolePayload,
+    albumPhotos, resolveAlbumPhoto, sendPhotoV2, extractPhotoMarkers,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     collectors, setupSleepTimerV2,
