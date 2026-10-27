@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { test } from 'node:test';
-import { parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from '../src/role-card.js';
+import { findRecallSection, parseRecallSections, parseRoleSections, pickRecallSections, recallSectionIndex, roleCharStats, roleSectionReport, selectRoleText } from '../src/role-card.js';
 
 const CARD = [
   '# 角色卡：测试',
@@ -105,4 +105,111 @@ test('真实人格卡可用，且筛选不丢公共内容', () => {
   }
   // 二代注入的文本里不应再出现一代的分条机制
   assert.doesNotMatch(v2, /空格分隔（例如|\[SILENT\]/);
+});
+
+// ── 「核心约束 + 按需召回」──────────────────────────────────────────────
+const RECALL = [
+  '# 召回文件',
+  '',
+  '## 〔触发: 照片|长相|自拍〕 外形与样子',
+  '- 冷白皮，脸很小。',
+  '',
+  '## 〔触发: 生气|吵架|哄〕 生气详解',
+  '- 回复变短，语气变冷。',
+  '',
+  '## 〔触发: 帮我|查一下〕 小秘书',
+  '- 结论先说。',
+].join('\n');
+
+test('召回小节：标题里的触发词被拆开，普通标题结束小节', () => {
+  const sections = parseRecallSections(RECALL);
+  assert.deepEqual(sections.map((s) => s.title), ['外形与样子', '生气详解', '小秘书']);
+  assert.deepEqual(sections[0].triggers, ['照片', '长相', '自拍']);
+  assert.equal(sections[1].body, '- 回复变短，语气变冷。');
+  // 一级标题只是分隔，不会变成召回小节
+  assert.ok(!sections.some((s) => s.title === '召回文件'));
+});
+
+test('召回：按关键词命中，没命中就什么都不带', () => {
+  const hit = pickRecallSections(RECALL, '给我看下照片呗');
+  assert.deepEqual(hit.picked, ['外形与样子']);
+  assert.match(hit.text, /冷白皮/);
+  const miss = pickRecallSections(RECALL, '今天天气不错');
+  assert.equal(miss.text, '');
+  assert.deepEqual(miss.picked, []);
+  // 空消息不乱召回
+  assert.equal(pickRecallSections(RECALL, '   ').text, '');
+});
+
+test('召回：更长的触发词优先，limit 生效', () => {
+  const two = pickRecallSections(RECALL, '你帮我查一下那个东西，顺便发张照片', { limit: 2 });
+  assert.equal(two.picked.length, 2, 'limit=2 应最多两节');
+  assert.equal(two.picked[0], '小秘书', '更具体/更长的触发词应先命中');
+  const one = pickRecallSections(RECALL, '你帮我查一下那个东西，顺便发张照片', { limit: 1 });
+  assert.deepEqual(one.picked, ['小秘书']);
+});
+
+test('召回：超预算时截断并留下「用 section 看全」的提示', () => {
+  const long = ['## 〔触发: 长文〕 很长的一节', '- ' + '字'.repeat(600)].join('\n');
+  const picked = pickRecallSections(long, '来点长文', { maxChars: 300 });
+  assert.deepEqual(picked.picked, ['很长的一节']);
+  assert.ok(picked.text.length < 420, '应被预算截住');
+  assert.match(picked.text, /qq_get_prompt/);
+});
+
+test('召回目录与按名字取节（精确 / 包含 / 触发词）', () => {
+  const index = recallSectionIndex(RECALL);
+  assert.deepEqual(index.map((s) => s.title), ['外形与样子', '生气详解', '小秘书']);
+  assert.ok(index.every((s) => s.chars > 0 && s.triggers.length > 0));
+  assert.equal(findRecallSection(RECALL, '外形与样子').title, '外形与样子');
+  assert.equal(findRecallSection(RECALL, '生气').title, '生气详解');
+  assert.equal(findRecallSection(RECALL, '吵架').title, '生气详解');
+  assert.equal(findRecallSection(RECALL, '不存在的一节'), null);
+});
+
+test('真实人格卡：core 与 recall 可解析，核心明显短于整卡', () => {
+  const coreFile = new URL('../roles/鱼小冷.core.md', import.meta.url);
+  const recallFile = new URL('../roles/鱼小冷.recall.md', import.meta.url);
+  const fullFile = new URL('../roles/鱼小冷.md', import.meta.url);
+  const core = fs.readFileSync(coreFile, 'utf8');
+  const recall = fs.readFileSync(recallFile, 'utf8');
+  const full = fs.readFileSync(fullFile, 'utf8');
+  assert.ok(core.length > 1000, '核心卡不应为空');
+  assert.ok(core.length < full.length * 0.45, `核心应明显短于整卡（core=${core.length} full=${full.length}）`);
+  const sections = parseRecallSections(recall);
+  assert.ok(sections.length >= 6, '召回细节应拆成多节');
+  for (const section of sections) {
+    assert.ok(section.triggers.length > 0, `${section.title} 缺触发词`);
+    assert.ok(section.body.length <= 1600, `${section.title} 太长（${section.body.length}）`);
+  }
+  // 核心卡里的关键硬约束必须还在
+  for (const must of ['球球', '不像客服', '不写小作文', '不查岗']) {
+    assert.match(core, new RegExp(must.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), `核心卡缺「${must}」`);
+  }
+  // 召回要能被常见话术命中
+  assert.ok(pickRecallSections(recall, '你长什么样，发张照片').picked.length > 0);
+  assert.ok(pickRecallSections(recall, '你是不是生气了').picked.length > 0);
+});
+
+test('拆分不丢内容：整卡每个小节都能在 core 或 recall 里找到落点', () => {
+  const core = fs.readFileSync(new URL('../roles/鱼小冷.core.md', import.meta.url), 'utf8');
+  const recall = fs.readFileSync(new URL('../roles/鱼小冷.recall.md', import.meta.url), 'utf8');
+  const full = fs.readFileSync(new URL('../roles/鱼小冷.md', import.meta.url), 'utf8');
+  const norm = (s) => String(s).replace(/\s+/g, '');
+  const bag = norm(core) + norm(recall);
+  const sections = parseRoleSections(full).filter((s) => s.heading);
+  const missing = [];
+  for (const section of sections) {
+    // 卡名标题（「角色卡：鱼小冷」）下面只有维护说明，不是人设内容，跳过
+    if (/^角色卡/.test(section.heading)) continue;
+    // 每节的正文行里至少有 1 行（足够长的）落在 core/recall 里，就算这节没被丢
+    const lines = section.lines
+      .map((line) => line.replace(/^#+\s*/, '').replace(/^[-*]\s*/, '').replace(/^>\s*/, '').trim())
+      .filter((line) => line.length >= 10);
+    // 纯标题小节（如整卡的「# 角色卡：鱼小冷」）没有正文，跳过
+    if (lines.length === 0) continue;
+    const hit = lines.some((line) => bag.includes(norm(line)));
+    if (!hit) missing.push(section.heading);
+  }
+  assert.deepEqual(missing, [], `这些小节在 core/recall 里没有落点：${missing.join('、')}`);
 });

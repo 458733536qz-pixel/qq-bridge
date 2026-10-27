@@ -20,12 +20,14 @@ import * as modelPrices from '../src/model-prices.js';
 import * as tokenLedger from '../src/token-ledger.js';
 import * as voiceLib from '../src/send-voice-lib.js';
 import * as presetPrompt from '../src/preset-prompt.js';
+import * as roleCard from '../src/role-card.js';
 import * as stateAcl from '../src/state-acl.mjs';
+import * as ttsApi from '../src/tts-api.js';
 import { unwrap, createTurnCollector } from '../src/dsh-client.js';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 export async function bridgeHarness({ config = {}, savedState, files = {}, globals = {} } = {}) {
-  const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'qq-audit-bridge-'));
+  const temp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'qq-audit-bridge-')));
   fs.mkdirSync(path.join(temp, 'src'));
   fs.mkdirSync(path.join(temp, 'state'));
   fs.writeFileSync(path.join(temp, 'config.json'), JSON.stringify({
@@ -123,6 +125,12 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     }
   }
   let source = fs.readFileSync(path.join(root, 'src/bridge.js'), 'utf8');
+  // Optional locally-installed persona reference is not part of the isolated bridge fixture.
+  source = source.replace(/^try \{.*await import\('file:.*xiaoleng-chatlife.*\); \} catch \{\}\s*$/gm, '');
+  // 连续性模块也是顶层 `await import(...)`：VM 里没有 dynamic import，import 会失败并走
+  // log()，而 log() 依赖的 appendBridgeLog 此时还没初始化（TDZ）→ 整个 fixture 挂掉。
+  // 隔离 fixture 里不需要它（continuity 有自己的 20 项单测），直接等价地降级成「没装」。
+  source = source.replace(/^try \{\n\s*continuity = await import\([^\n]*\);\n\} catch \(error\) \{[\s\S]*?\n\}\s*$/m, 'continuity = null;');
   // 去掉顶层 import（VM 里靠 context 注入提供这些绑定）。
   // 必须按行处理：这些 import 有**多行**写法，用单行正则（/^import[\s\S]*?;/gm）会在
   // 第一个分号处停下，把紧跟其后的正常代码一起删掉（曾把 `cfg.socialV2.voice = {…}`
@@ -147,6 +155,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     sendToQQ, sendStickerV2, handleIncoming, startConsoleServer, cfg, state, api, promptQueues,
     getSocialV2State, appendSocialV2Message, recordSentMessagesV2,
     buildWakePromptV2, buildWakeSnapshotV2, sendWakePromptV2, socialV2,
+    roleCoreContent, roleRecallContent, roleHintForMode, buildRolePayload,
     syncStickerLibrary, listStickersForV2, getStickerImageData,
     refreshMode, modeAllowed, trackTurnEvent, replayPendingWakeReasonsV2,
     collectors, setupSleepTimerV2,
@@ -163,7 +172,7 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
       selfNickname = selfDisplayName.toLowerCase() || 'deepseek';
     },
     flushQueue, retireSession,
-    voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
+    tts, ttsSendJobs, voiceCfg, voiceLibrary, resolveVoicePathForV2, resolveVoicePathForOperator,
     voiceBudgetCheck, sendVoiceV2, sendVoiceForV2, assertOutboundAuditOk,
     setMode(value) { currentMode = value; },
     setReady(value) { dshReady = value; },
@@ -187,7 +196,10 @@ export async function bridgeHarness({ config = {}, savedState, files = {}, globa
     SnowLumaWebSocketClient: FakeBot, text: (s) => s,
     discoverDshLaunchToken: () => '', unwrap, createTurnCollector,
     ...markdown, ...sensitive, ...wait, ...safeFetch, ...forward, ...slang, ...sticker,
-    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt,
+    ...modelPrices, ...tokenLedger, ...voiceLib, ...stateAcl, ...presetPrompt, ...ttsApi, ...roleCard,
+    // Keep local character data out of the isolated network/audit fixture.
+    xiaolengTravelContext: () => '', affinityPromptSection: () => '', readAffinity: () => ({}), tickAffinity: () => ({}),
+    moodPromptLine: () => '', moodDeltaFromText: () => 0, nudgeMood: () => {},
     // 桥接的出图出口会调归一化（体积/动图抽帧）：VM 里必须能拿到这几个函数。
     normalizeImageForModel: mediaNormalize.normalizeImageForModel,
     sniffImage: mediaNormalize.sniffImage,

@@ -329,6 +329,7 @@ const TOOL_CONFIG_FLAGS = {
   qq_slang_query: 'slangQuery',
   qq_slang_submit: 'slangSubmit',
   qq_send_voice: 'sendVoice',
+  qq_tts_send: 'sendVoice',
   qq_list_voices: 'sendVoice',
   // 下面这些曾经漏登记。漏一个不是"多注册一个工具"那么轻：桥接那边按 `v2ToolEnabled(flag)`
   // 在**调用期**一律 403，而这里不登记就等于"控制台显示已关闭、模型每次请求仍收到它的完整
@@ -568,11 +569,16 @@ server.tool(
 // ── 二代仿真模式（reserved2）工具 ─────────────────────────────────────────
 server.tool(
   'qq_get_prompt',
-  '查看当前二代仿真模式的提示词/角色/推荐值/可用工具/当前唤醒配置（只读）。',
-  { key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'), token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）') },
-  async ({ key, token }) => {
+  '查看当前二代仿真模式的提示词/角色/推荐值/可用工具/当前唤醒配置（只读）。role.hint 是每轮都在的核心人设；需要更细的人设小节（外形/性格/生气/好感度/小秘书/生活/示例…）时，带 section 参数取那一节。',
+  {
+    key: z.string().describe('会话 key，格式 group:群号 或 private:QQ号'),
+    token: z.string().describe('会话令牌（见唤醒提示中的【会话令牌】）'),
+    section: z.string().optional().describe('可选：要细看的人设小节标题（见返回里的 role.sections，例如「外形与样子」「生气详解与收场」）。不带就只回核心 + 目录。'),
+  },
+  async ({ key, token, section }) => {
     try {
-      const data = await agentApi(`/api/socialV2/prompt?key=${encodeURIComponent(key)}`, { headers: { 'x-agent-token': token } });
+      const suffix = section ? `&section=${encodeURIComponent(section)}` : '';
+      const data = await agentApi(`/api/socialV2/prompt?key=${encodeURIComponent(key)}${suffix}`, { headers: { 'x-agent-token': token } });
       return { content: [{ type: 'text', text: serializeModelData(data) }] };
     } catch (error) {
       return { content: [{ type: 'text', text: `获取提示词失败：${error?.message ?? error}` }], isError: true };
@@ -1195,6 +1201,18 @@ if (cfg.socialV2?.sticker?.enabled !== false && cfg.socialV2?.tools?.collectStic
 }
 
 if (cfg.socialV2?.voice?.enabled !== false && cfg.socialV2?.tools?.sendVoice !== false) {
+  server.tool(
+    'qq_tts_send',
+    '用控制台保存的TTS设置把文字合成为一条QQ语音并发送。模型、音色、密钥由管理员设置，你不能改。每次新内容给一个8至100位requestId；结果未知时沿用同一ID，禁止用新ID盲目重试。受原有会话令牌、目标白名单、静默、频率、时长限制。普通聊天偶尔使用；只有verified=true才代表QQ已回读到语音。delivery可按本句选择natural日常、warm温暖、playful打趣、comfort安慰、quiet轻声，保持同一音色；不需要额外模型调用。MiMo语音的text可按语境少量使用[叹气]、[气声]、[轻笑]等表演标签，不要每句话都加。sing仅在管理员选择支持唱歌的MiMo预设模型时可用。',
+    { key: z.string(), token: z.string(), text: z.string().min(1).max(3000), requestId: z.string().min(8).max(100), sing: z.boolean().optional(), delivery: z.enum(['natural','warm','playful','comfort','quiet']).optional().describe('可选的本句语气，仅MiMo预设语音生效') },
+    async ({key,token,text,requestId,sing,delivery}) => {
+      try {
+        const data = await agentApi('/api/socialV2/tts-send', { method: 'POST', headers: { 'x-agent-token': token }, body: JSON.stringify({key,token,text,requestId,sing:sing===true,delivery}), timeoutMs: 300000 });
+        return {content:[{type:'text',text:serializeModelData(data)}]};
+      } catch (error) { return {content:[{type:'text',text:`TTS合成发送失败：${error?.message || error}；结果未知请保留原requestId，不要盲目重试。`}],isError:true}; }
+    }
+  );
+
   server.tool(
     'qq_send_voice',
     '在指定会话发一条 QQ 语音（把语音库里准备好的音频当语音条发出去）。voice 传 qq_list_voices 返回的 name（文件名，可带子目录），也可以直接传语音库里的文件名（不带扩展名也能匹配）。注意：① 只能发语音库（qq-bridge/audio/）里的文件，不能发任意本地路径，也不能发 URL/base64；② 受时长与频率上限约束（见 qq_list_voices 的 limits），超限会被拒绝；③ 语音是「开口说话」的强表达，别滥用，闲聊里偶尔发一条即可；④ 返回的 verified=true 表示已经用 get_msg 回读到这条消息的 record 段（语音确实落地了）—— 只有 verified=true 才能对用户说你发了语音；⑤ readback 只对「收到的」语音有意义（QQ 会转写别人的语音），自己发的语音一般拿不到转写文本，默认关闭，别依赖它。',
