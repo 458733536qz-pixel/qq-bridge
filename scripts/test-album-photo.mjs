@@ -201,6 +201,21 @@ await check('分条发送（qq_send_burst）也会摘掉 [照片]，不会把标
   }
 });
 
+
+await check('兜底：别的发送路径（qq_reply 等）漏摘的标记也不会发到 QQ', async () => {
+  // 文本走 fake bot（calls.sent），不是 HTTP 网关，所以看 calls.sent。
+  h.calls.sent.length = 0;
+  await h.sendToQQ('private:123', '刚拍的 [照片] 5');
+  const texts = h.calls.sent.map((item) => String(item.text ?? ''));
+  assert.ok(texts.length >= 1, '应发出文字');
+  assert.ok(texts.every((t) => !/\[照片\]/.test(t)), '最后一道网必须摘掉标记');
+  assert.ok(texts.some((t) => /刚拍的/.test(t)), '正常文字要保留');
+  // 整条都是标记时不发空消息
+  h.calls.sent.length = 0;
+  await h.sendToQQ('private:123', '[照片] 5');
+  assert.equal(h.calls.sent.length, 0, '只有标记时不该发任何消息');
+});
+
 await h.close();
 const bad = failed > 0;
 console.log(bad ? `\n❌ ${failed} 项失败` : '\n全部通过');

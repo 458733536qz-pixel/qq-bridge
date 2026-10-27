@@ -144,6 +144,20 @@ function extractPhotoMarkers(input) {
 }
 
 /**
+ * 最后一道网：任何还没被摘掉的标记都不许出现在 QQ 里。
+ * 主路径（send-message / send-burst）会用 processOutgoingMarkers 真正处理（还会真发照片）；
+ * 但 qq_reply 走的是另一条老接口，标记到那儿就没人摘了——球球会直接看见 "[照片] 2"。
+ * 宁可少几个字，也不让内部记号漏到聊天里。
+ */
+function stripLeftoverMarkers(input) {
+  return String(input ?? '')
+    .replace(/\[\s*(?:私日记|日记|事件完|事件|照片)\s*\][^\[\n]{0,80}/g, '')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/**
  * 统一处理她要发出去的文本里带的标记：日记 / 事件 / 照片。
  * 返回去掉标记后的文本与待发照片。几条发送路径（send-message / send-burst）共用，
  * 否则 [照片] 会原样发到 QQ 里——那是球球能直接看见的 bug，不能赌她会走哪条路。
@@ -7852,7 +7866,12 @@ async function main() {
 
   function sendToQQ(key, msg) {
     const assertSendAllowed = captureSendGuard(key);
-    const safeMsg = redactKnownTokensOnly(msg);
+    const safeMsg = redactKnownTokensOnly(stripLeftoverMarkers(msg));
+    if (!safeMsg) {
+      // 整条都是标记：没有要发的话，别发空消息。
+      log(`[marker] ${key} 的消息只剩标记，已跳过发送`);
+      return sendChain;
+    }
     const [kind, id] = key.split(':');
     const parts = splitForQQ(safeMsg);
     lastSendFailed.delete(key);
